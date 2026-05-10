@@ -1,0 +1,855 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import Link from "next/link";
+import { Address } from "@scaffold-ui/components";
+import type { NextPage } from "next";
+import { encodeAbiParameters, formatUnits, keccak256, pad, parseUnits, toHex } from "viem";
+import { useAccount, usePublicClient, useReadContracts, useWriteContract } from "wagmi";
+import { BugAntIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
+import deployedContracts from "~~/contracts/deployedContracts";
+import { SNAPSHOT_ID } from "~~/contracts/snapshot";
+import { useScaffoldReadContract, useScaffoldWriteContract, useTargetNetwork } from "~~/hooks/scaffold-eth";
+import { notification } from "~~/utils/scaffold-eth";
+
+// Aave V3 numeric revert codes (subset most likely to hit during demos).
+const AAVE_ERRORS: Record<string, string> = {
+  "1": "caller not pool admin",
+  "26": "invalid amount",
+  "27": "reserve inactive",
+  "28": "reserve frozen",
+  "29": "reserve paused",
+  "30": "borrowing not enabled",
+  "31": "stable borrowing not enabled",
+  "32": "no debt of selected type",
+  "33": "invalid interest rate mode",
+  "34": "collateral balance is 0",
+  "35": "HF below liquidation threshold",
+  "36": "collateral can't cover new borrow",
+  "37": "collateral == borrow currency",
+  "38": "amount > max loan size stable",
+  "39": "no debt of selected type",
+  "43": "borrow cap exceeded",
+  "44": "supply cap exceeded",
+  "45": "HF not below threshold (can't liquidate)",
+  "46": "collateral can't be liquidated",
+  "47": "user didn't borrow that currency",
+};
+
+const explainError = (e: any): string => {
+  const raw = e?.shortMessage ?? e?.cause?.shortMessage ?? e?.details ?? e?.message ?? String(e);
+  const m = raw.match(/reverted with the following reason:\s*(\d+)/);
+  if (m && AAVE_ERRORS[m[1]]) return `${raw}\n→ Aave: ${AAVE_ERRORS[m[1]]}`;
+  return raw;
+};
+
+const WETH = "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590" as const;
+const PYUSD = "0x99aF3EeA856556646C98c8B9b2548Fe815240750" as const;
+const AAVE_POOL = "0xbC92aaC2DBBF42215248B5688eB3D3d2b32F2c8d" as const;
+const AAVE_ORACLE = "0x7287f12c268d7Dff22AAa5c2AA242D7640041cB1" as const;
+const PUNCH_FACTORY = "0xf331959366032a634c7cAcF5852fE01ffdB84Af0" as const;
+const POOL_FEE = 3000;
+
+const factoryAbi = [
+  {
+    type: "function",
+    name: "getPool",
+    stateMutability: "view",
+    inputs: [
+      { name: "tokenA", type: "address" },
+      { name: "tokenB", type: "address" },
+      { name: "fee", type: "uint24" },
+    ],
+    outputs: [{ name: "pool", type: "address" }],
+  },
+] as const;
+
+const aaveOracleAbi = [
+  {
+    type: "function",
+    name: "getAssetPrice",
+    stateMutability: "view",
+    inputs: [{ name: "asset", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+
+const aavePoolAbi = [
+  {
+    type: "function",
+    name: "getUserAccountData",
+    stateMutability: "view",
+    inputs: [{ name: "user", type: "address" }],
+    outputs: [
+      { name: "totalCollateralBase", type: "uint256" },
+      { name: "totalDebtBase", type: "uint256" },
+      { name: "availableBorrowsBase", type: "uint256" },
+      { name: "currentLiquidationThreshold", type: "uint256" },
+      { name: "ltv", type: "uint256" },
+      { name: "healthFactor", type: "uint256" },
+    ],
+  },
+] as const;
+
+const erc20Abi = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "owner", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
+
+// Integer sqrt for BigInt — Newton's method.
+const bigintSqrt = (n: bigint): bigint => {
+  if (n < 2n) return n;
+  let x = n;
+  let y = (x + 1n) / 2n;
+  while (y < x) {
+    x = y;
+    y = (x + n / x) / 2n;
+  }
+  return x;
+};
+
+// Move a Uniswap-V3-style pool's `slot0` to a new sqrtPriceX96 derived from
+// `humanPrice0In1` (= human-units-of-token1 per 1 human-unit-of-token0). Pool
+// must have full-range liquidity already (we seeded it that way).
+const setPoolPrice = async (
+  publicClient: any,
+  pool: `0x${string}`,
+  dec0: number,
+  dec1: number,
+  humanPrice0In1: number,
+) => {
+  const priceE18 = BigInt(Math.round(humanPrice0In1 * 1e18));
+  const num = priceE18 * 10n ** BigInt(dec1) * (1n << 192n);
+  const denom = 10n ** 18n * 10n ** BigInt(dec0);
+  const sqrtPriceX96 = bigintSqrt(num / denom);
+
+  const ratio = humanPrice0In1 * 10 ** (dec1 - dec0);
+  const tickNum = Math.floor(Math.log(ratio) / Math.log(1.0001));
+  const tick24 = tickNum < 0 ? BigInt(tickNum) + (1n << 24n) : BigInt(tickNum);
+
+  // slot0 layout: [0..160) sqrtPriceX96, [160..184) int24 tick, [184..256) the rest.
+  const existingHex = await publicClient.request({
+    method: "eth_getStorageAt",
+    params: [pool, "0x0", "latest"],
+  });
+  const existing = BigInt(existingHex);
+  const upperMask = ~((1n << 184n) - 1n);
+  const newWord = (existing & upperMask) | (tick24 << 160n) | sqrtPriceX96;
+  const newHex = "0x" + newWord.toString(16).padStart(64, "0");
+
+  await publicClient.request({
+    method: "anvil_setStorageAt",
+    params: [pool, "0x0", newHex],
+  });
+  // anvil_setStorageAt doesn't bump the block — mine one so wagmi refetches.
+  await publicClient.request({
+    method: "anvil_mine",
+    params: ["0x1"],
+  });
+};
+
+const Stat = ({
+  label,
+  value,
+  sub,
+  tone,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  tone?: "ok" | "warn" | "danger";
+}) => (
+  <div className="flex justify-between items-baseline gap-4 py-1 border-b border-base-300 last:border-0">
+    <span className="text-sm opacity-70">{label}</span>
+    <span className="text-right">
+      <span
+        className={`font-mono ${
+          tone === "danger" ? "text-error" : tone === "warn" ? "text-warning" : tone === "ok" ? "text-success" : ""
+        }`}
+      >
+        {value}
+      </span>
+      {sub && <div className="text-xs opacity-60 font-mono">{sub}</div>}
+    </span>
+  </div>
+);
+
+const Home: NextPage = () => {
+  const { address: connectedAddress } = useAccount();
+  const { targetNetwork } = useTargetNetwork();
+
+  const [depositAmount, setDepositAmount] = useState("");
+  const [redeemShares, setRedeemShares] = useState("");
+  const [wethPriceUsd, setWethPriceUsd] = useState("");
+  const [targetHf, setTargetHf] = useState("1.20");
+  const [yieldPriceUsd, setYieldPriceUsd] = useState("1.00");
+
+  const vaultAddr = deployedContracts[31337].FCMVault.address as `0x${string}`;
+
+  const { data: totalAssets } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "totalAssets",
+  });
+
+  const { data: shareBalance } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "balanceOf",
+    args: [connectedAddress],
+  });
+
+  const { data: shareValueWeth } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "convertToAssets",
+    args: [shareBalance],
+  });
+
+  const { data: aTokenAddr } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "aToken",
+  });
+
+  const { data: debtTokenAddr } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "variableDebtToken",
+  });
+
+  const { data: yieldAssetAddr } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "yieldAsset",
+  });
+
+  const { data: stats } = useReadContracts({
+    allowFailure: true,
+    query: { refetchInterval: 4000 },
+    contracts: [
+      // 0: WETH balance of user
+      { address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [connectedAddress!] },
+      // 1: collateral (aToken bal of vault) — equals collateral value in WETH
+      { address: aTokenAddr, abi: erc20Abi, functionName: "balanceOf", args: [vaultAddr] },
+      // 2: debt (debtToken bal of vault) — in PYUSD (6 dec)
+      { address: debtTokenAddr, abi: erc20Abi, functionName: "balanceOf", args: [vaultAddr] },
+      // 3: yield bal of vault — in mYLD (18 dec)
+      { address: yieldAssetAddr, abi: erc20Abi, functionName: "balanceOf", args: [vaultAddr] },
+      // 4: oracle price of WETH (1e8 base)
+      { address: AAVE_ORACLE, abi: aaveOracleAbi, functionName: "getAssetPrice", args: [WETH] },
+      // 5: oracle price of PYUSD
+      { address: AAVE_ORACLE, abi: aaveOracleAbi, functionName: "getAssetPrice", args: [PYUSD] },
+      // 6: oracle price of yield asset
+      { address: AAVE_ORACLE, abi: aaveOracleAbi, functionName: "getAssetPrice", args: [yieldAssetAddr!] },
+      // 7: aave HF (index 5 of tuple)
+      { address: AAVE_POOL, abi: aavePoolAbi, functionName: "getUserAccountData", args: [vaultAddr] },
+      // 8: PYUSD↔WETH pool address
+      { address: PUNCH_FACTORY, abi: factoryAbi, functionName: "getPool", args: [WETH, PYUSD, POOL_FEE] },
+      // 9: PYUSD↔mYLD pool address
+      { address: PUNCH_FACTORY, abi: factoryAbi, functionName: "getPool", args: [yieldAssetAddr!, PYUSD, POOL_FEE] },
+    ],
+  });
+
+  const { writeContractAsync: writeVault, isPending: depositPending } = useScaffoldWriteContract({
+    contractName: "FCMVault",
+  });
+  const { writeContractAsync: writePrice, isPending: pricePending } = useScaffoldWriteContract({
+    contractName: "MockPriceSource",
+  });
+  const { writeContractAsync: writeErc20 } = useWriteContract();
+  const publicClient = usePublicClient();
+
+  const handleResetChain = async () => {
+    if (!publicClient) return;
+    if (!confirm("Revert the chain to the post-deploy snapshot? All txs since then will be lost.")) return;
+    try {
+      // Use the most recent snapshot — the deploy-time one initially, or the
+      // one created by the previous Reset.
+      const id = (typeof window !== "undefined" && window.localStorage.getItem("snapshotId")) || SNAPSHOT_ID;
+
+      const ok = await publicClient.request({
+        method: "evm_revert" as any,
+        params: [id] as any,
+      });
+      if (!ok) throw new Error("evm_revert returned false (snapshot stale?)");
+
+      // evm_revert consumes the snapshot — take a new one of the same state.
+      const newId = await publicClient.request({
+        method: "evm_snapshot" as any,
+        params: [] as any,
+      });
+      window.localStorage.setItem("snapshotId", newId as string);
+
+      notification.success("chain reverted to post-deploy state");
+      // Refresh so wagmi re-reads everything against the reverted state.
+      window.location.reload();
+    } catch (e: any) {
+      notification.error(explainError(e));
+    }
+  };
+
+  // A second hardcoded EOA, used by the "other user" demo button. Anvil signs
+  // for it via anvil_impersonateAccount.
+  const OTHER_USER = "0x000000000000000000000000000000000000b0b0" as const;
+  const LIQUIDATOR = "0x000000000000000000000000000000000000c0c0" as const;
+
+  const handleOtherUserDeposit = async () => {
+    if (!publicClient || !depositAmount) return;
+    try {
+      const amount = parseUnits(depositAmount, 18);
+
+      await publicClient.request({
+        method: "anvil_impersonateAccount" as any,
+        params: [OTHER_USER] as any,
+      });
+      await publicClient.request({
+        method: "anvil_setBalance" as any,
+        params: [OTHER_USER, "0x56BC75E2D63100000"] as any, // 100 ETH gas
+      });
+
+      // Give them `amount` WETH via storage write (slot 1).
+      const slot = 1n;
+      const key = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [OTHER_USER, slot]));
+      const target = pad(toHex(amount), { size: 32 });
+      await publicClient.request({
+        method: "anvil_setStorageAt" as any,
+        params: [WETH, key, target] as any,
+      });
+
+      // approve(vault, amount)
+      const approveData =
+        "0x095ea7b3" + vaultAddr.slice(2).padStart(64, "0").toLowerCase() + amount.toString(16).padStart(64, "0");
+      await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: OTHER_USER, to: WETH, data: approveData, gas: "0x186a0" }] as any,
+      });
+
+      // deposit(amount, OTHER_USER) — selector 6e553f65
+      const depositData =
+        "0x6e553f65" + amount.toString(16).padStart(64, "0") + OTHER_USER.slice(2).padStart(64, "0").toLowerCase();
+      await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: OTHER_USER, to: vaultAddr, data: depositData, gas: "0x7a1200" }] as any,
+      });
+
+      await publicClient.request({
+        method: "anvil_stopImpersonatingAccount" as any,
+        params: [OTHER_USER] as any,
+      });
+
+      notification.success(`other user deposited ${depositAmount} WETH`);
+    } catch (e: any) {
+      try {
+        await publicClient.request({
+          method: "anvil_stopImpersonatingAccount" as any,
+          params: [OTHER_USER] as any,
+        });
+      } catch {}
+      notification.error(explainError(e));
+    }
+  };
+
+  const handleLiquidate = async () => {
+    if (!publicClient) return;
+    try {
+      // Impersonate + fund with native gas.
+      await publicClient.request({
+        method: "anvil_impersonateAccount" as any,
+        params: [LIQUIDATOR] as any,
+      });
+      await publicClient.request({
+        method: "anvil_setBalance" as any,
+        params: [LIQUIDATOR, "0x56BC75E2D63100000"] as any,
+      });
+
+      // Fund liquidator with PYUSD via storage write (slot 1, 1M PYUSD).
+      const slot = 1n;
+      const key = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [LIQUIDATOR, slot]));
+      const target = pad(toHex(parseUnits("1000000", 6)), { size: 32 });
+      await publicClient.request({
+        method: "anvil_setStorageAt" as any,
+        params: [PYUSD, key, target] as any,
+      });
+
+      // approve(AAVE_POOL, max) on PYUSD — selector 095ea7b3
+      const approveData = "0x095ea7b3" + AAVE_POOL.slice(2).padStart(64, "0").toLowerCase() + "f".repeat(64);
+      await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: LIQUIDATOR, to: PYUSD, data: approveData, gas: "0x186a0" }] as any,
+      });
+
+      // liquidationCall(WETH, PYUSD, vault, type(uint256).max, false)
+      // selector = 00a718a9
+      const liqData =
+        "0x00a718a9" +
+        WETH.slice(2).padStart(64, "0").toLowerCase() +
+        PYUSD.slice(2).padStart(64, "0").toLowerCase() +
+        vaultAddr.slice(2).padStart(64, "0").toLowerCase() +
+        "f".repeat(64) +
+        "0".repeat(64);
+      const txHash = (await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: LIQUIDATOR, to: AAVE_POOL, data: liqData, gas: "0xf42400" }] as any,
+      })) as `0x${string}`;
+
+      // Wait for the receipt and check the status — eth_sendTransaction
+      // returns the hash even if the tx will revert.
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash: txHash,
+      });
+
+      await publicClient.request({
+        method: "anvil_stopImpersonatingAccount" as any,
+        params: [LIQUIDATOR] as any,
+      });
+
+      if (receipt.status !== "success") {
+        throw new Error("liquidationCall reverted (HF likely ≥ 1)");
+      }
+
+      notification.success("liquidation succeeded");
+    } catch (e: any) {
+      try {
+        await publicClient.request({
+          method: "anvil_stopImpersonatingAccount" as any,
+          params: [LIQUIDATOR] as any,
+        });
+      } catch {}
+      notification.error(explainError(e));
+    }
+  };
+
+  // Devnet faucet: write into the WETH `_balances` mapping via anvil_setStorageAt.
+  // Slot 1 is verified by postDeploy.js for the bridged WETH on Flow EVM.
+  const handleGetWeth = async () => {
+    if (!connectedAddress || !publicClient) return;
+    try {
+      const slot = 1n;
+      const key = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [connectedAddress, slot]));
+      const target = pad(toHex(parseUnits("10", 18)), { size: 32 });
+      await publicClient.request({
+        method: "anvil_setStorageAt" as any,
+        params: [WETH, key, target] as any,
+      });
+      await publicClient.request({
+        method: "anvil_mine" as any,
+        params: ["0x1"] as any,
+      });
+      notification.success("got 10 WETH");
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "faucet failed");
+    }
+  };
+
+  const handleDeposit = async () => {
+    if (!depositAmount || !connectedAddress) return;
+    try {
+      const amount = parseUnits(depositAmount, 18);
+      notification.info("approving WETH...");
+      await writeErc20({
+        address: WETH,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [vaultAddr, amount],
+      });
+      notification.info("depositing...");
+      await writeVault({
+        functionName: "deposit",
+        args: [amount, connectedAddress],
+      });
+      notification.success("deposit complete");
+      setDepositAmount("");
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "deposit failed");
+    }
+  };
+
+  const handleRedeem = async () => {
+    if (!redeemShares || !connectedAddress) return;
+    try {
+      const shares = parseUnits(redeemShares, 18);
+      await writeVault({
+        functionName: "redeem",
+        args: [shares, connectedAddress, connectedAddress],
+      });
+      notification.success("redeem complete");
+      setRedeemShares("");
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "redeem failed");
+    }
+  };
+
+  const handleSetMaxShares = () => {
+    if (shareBalance) setRedeemShares(formatUnits(shareBalance, 18));
+  };
+
+  const moveWethPool = async (priceUsd: number) => {
+    if (!publicClient || !wethPoolAddr) return;
+    // Pool sorts by address: WETH (0x2F..) < PYUSD (0x99..) → token0=WETH, token1=PYUSD.
+    // 1 WETH = priceUsd PYUSD (we treat PYUSD ≈ $1).
+    await setPoolPrice(publicClient, wethPoolAddr, 18, 6, priceUsd);
+  };
+
+  const moveYieldPool = async (priceUsd: number) => {
+    if (!publicClient || !yieldPoolAddr || !yieldAssetAddr) return;
+    // Determine token order at runtime — mYLD address is dynamic.
+    const yieldIsToken0 = yieldAssetAddr.toLowerCase() < PYUSD.toLowerCase();
+    if (yieldIsToken0) {
+      // token0=mYLD (18), token1=PYUSD (6). 1 mYLD = priceUsd PYUSD.
+      await setPoolPrice(publicClient, yieldPoolAddr, 18, 6, priceUsd);
+    } else {
+      // token0=PYUSD (6), token1=mYLD (18). 1 PYUSD = 1/priceUsd mYLD.
+      await setPoolPrice(publicClient, yieldPoolAddr, 6, 18, 1 / priceUsd);
+    }
+  };
+
+  const handleSetWethPrice = async () => {
+    try {
+      const priceFloat = parseFloat(wethPriceUsd);
+      const priceWith8Decimals = BigInt(Math.round(priceFloat * 1e8));
+      await writePrice({
+        functionName: "setPrice",
+        args: [priceWith8Decimals],
+      });
+      await moveWethPool(priceFloat);
+      notification.success(`WETH price → $${wethPriceUsd}`);
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "setPrice failed");
+    }
+  };
+
+  const handleSetYieldPrice = async () => {
+    try {
+      const priceFloat = parseFloat(yieldPriceUsd);
+      await moveYieldPool(priceFloat);
+      notification.success(`yield price → $${yieldPriceUsd}`);
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "setPrice failed");
+    }
+  };
+
+  // HF scales linearly with collateral price (HF = collat × LT / debt). To
+  // hit a target HF we set p_target = p_current × HF_target / HF_current.
+  const handleSetHealth = async () => {
+    if (!hf || !pColl) {
+      notification.error("HF/price not loaded yet");
+      return;
+    }
+    try {
+      const targetHfBig = parseUnits(targetHf, 18);
+      const newPrice = (pColl * targetHfBig) / hf; // 1e8
+      await writePrice({
+        functionName: "setPrice",
+        args: [newPrice],
+      });
+      const newPriceUsd = Number(newPrice) / 1e8;
+      await moveWethPool(newPriceUsd);
+      setWethPriceUsd(newPriceUsd.toFixed(2));
+      notification.success(`HF → ${targetHf} (WETH = $${newPriceUsd.toFixed(2)})`);
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "setHealth failed");
+    }
+  };
+
+  const handleRebalance = async () => {
+    try {
+      await writeVault({ functionName: "rebalance" });
+      notification.success("rebalanced");
+    } catch (e: any) {
+      notification.error(explainError(e) ?? "rebalance failed");
+    }
+  };
+
+  const fmtUnits = (v: bigint | undefined, dec: number) => (v === undefined ? "—" : formatUnits(v, dec));
+
+  const userWeth = stats?.[0]?.result as bigint | undefined;
+  const collat = stats?.[1]?.result as bigint | undefined; // 18 dec, in WETH
+  const debtAmount = stats?.[2]?.result as bigint | undefined; // 6 dec, PYUSD
+  const yieldAmount = stats?.[3]?.result as bigint | undefined; // 18 dec, mYLD
+  const pColl = stats?.[4]?.result as bigint | undefined; // 1e8
+  const pDebt = stats?.[5]?.result as bigint | undefined; // 1e8
+  const pYield = stats?.[6]?.result as bigint | undefined; // 1e8
+  const accountData = stats?.[7]?.result as readonly bigint[] | undefined;
+  const hf = accountData?.[5];
+  const wethPoolAddr = stats?.[8]?.result as `0x${string}` | undefined;
+  const yieldPoolAddr = stats?.[9]?.result as `0x${string}` | undefined;
+
+  // debt (PYUSD, 6 dec) → WETH (18 dec): debt * pDebt * 1e12 / pColl
+  const debtInColl = debtAmount && pDebt && pColl && pColl > 0n ? (debtAmount * pDebt * 10n ** 12n) / pColl : undefined;
+  // yield (mYLD, 18 dec) → WETH (18 dec): yield * pYield / pColl
+  const yieldInColl = yieldAmount && pYield && pColl && pColl > 0n ? (yieldAmount * pYield) / pColl : undefined;
+
+  const yieldPriceUsdFmt = pYield ? (Number(pYield) / 1e8).toFixed(4) : "—";
+  const wethPriceUsdFmt = pColl ? (Number(pColl) / 1e8).toFixed(2) : "—";
+  const hfFmt = hf ? Number(formatUnits(hf, 18)).toFixed(3) : "—";
+
+  // Sync the WETH price input with the on-chain value once we have it.
+  useEffect(() => {
+    if (pColl && wethPriceUsd === "") {
+      setWethPriceUsd((Number(pColl) / 1e8).toFixed(2));
+    }
+  }, [pColl, wethPriceUsd]);
+
+  return (
+    <div className="flex items-center flex-col grow pt-10 pb-16">
+      <div className="px-5 w-full max-w-3xl">
+        <div className="flex justify-end gap-2 mb-2">
+          <button className="btn btn-xs btn-error" onClick={handleResetChain}>
+            Reset chain
+          </button>
+        </div>
+        <h1 className="text-center">
+          <span className="block text-2xl mb-2">FCM</span>
+          <span className="block text-4xl font-bold">Leveraged WETH Vault</span>
+        </h1>
+
+        <div className="flex justify-center items-center space-x-2 flex-col mb-6">
+          <p className="my-2 font-medium">Connected:</p>
+          <Address address={connectedAddress} chain={targetNetwork} />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h3 className="card-title">Vault</h3>
+              <Stat label="TVL" value={`${fmtUnits(totalAssets, 18)} WETH`} />
+              <Stat label="WETH Price" value={`$${wethPriceUsdFmt}`} />
+              <Stat label="Collateral" value={`${fmtUnits(collat, 18)} WETH`} />
+              <Stat
+                label="Debt"
+                value={`${fmtUnits(debtAmount, 6)} PYUSD`}
+                sub={`= ${fmtUnits(debtInColl, 18)} WETH`}
+              />
+              <Stat
+                label="Yield"
+                value={`${fmtUnits(yieldAmount, 18)} mYLD`}
+                sub={`= ${fmtUnits(yieldInColl, 18)} WETH`}
+              />
+              <Stat
+                label="Health"
+                value={hfFmt}
+                tone={
+                  !hf ? undefined : hf < parseUnits("1.1", 18) ? "danger" : hf > parseUnits("1.5", 18) ? "warn" : "ok"
+                }
+              />
+              <Stat label="Yield Token Price" value={`$${yieldPriceUsdFmt}`} />
+            </div>
+          </div>
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h3 className="card-title">User Data</h3>
+              <Stat label="WETH Balance" value={`${fmtUnits(userWeth, 18)} WETH`} />
+              <Stat label="Your Shares" value={fmtUnits(shareBalance, 18)} />
+              <Stat label="Shares Value" value={`${fmtUnits(shareValueWeth, 18)} WETH`} />
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h2 className="card-title">Deposit</h2>
+              <p className="text-sm opacity-70">Approve + deposit WETH. Vault levers it up via Aave + PunchSwap V3.</p>
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input input-bordered"
+                placeholder="WETH amount (e.g. 0.1)"
+                value={depositAmount}
+                onChange={e => setDepositAmount(e.target.value)}
+              />
+              <div className="card-actions justify-between flex-wrap">
+                <button className="btn btn-ghost btn-sm" onClick={handleGetWeth}>
+                  Get 10 WETH (devnet)
+                </button>
+                <div className="flex gap-2">
+                  <button className="btn btn-secondary" disabled={!depositAmount} onClick={handleOtherUserDeposit}>
+                    Other user
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    disabled={!depositAmount || depositPending}
+                    onClick={handleDeposit}
+                  >
+                    {depositPending ? "depositing..." : "Deposit"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h2 className="card-title">Redeem</h2>
+              <p className="text-sm opacity-70">
+                Burn shares via the flash-loan unwind. Pays out WETH net of swap slippage.
+              </p>
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input input-bordered"
+                placeholder="shares to redeem"
+                value={redeemShares}
+                onChange={e => setRedeemShares(e.target.value)}
+              />
+              <div className="card-actions justify-between">
+                <button className="btn btn-ghost btn-sm" onClick={handleSetMaxShares} disabled={!shareBalance}>
+                  Max
+                </button>
+                <button className="btn btn-primary" disabled={!redeemShares || depositPending} onClick={handleRedeem}>
+                  {depositPending ? "redeeming..." : "Redeem"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h2 className="card-title">Set Collateral (WETH) Price</h2>
+              <p className="text-sm opacity-70">
+                Overrides the AaveOracle source for WETH. Moves the vault&apos;s Aave health factor directly.
+              </p>
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input input-bordered"
+                value={wethPriceUsd}
+                onChange={e => setWethPriceUsd(e.target.value)}
+              />
+              <div className="card-actions justify-end">
+                <button
+                  className="btn btn-secondary"
+                  disabled={pricePending || !wethPriceUsd}
+                  onClick={handleSetWethPrice}
+                >
+                  {pricePending ? "setting..." : "Set Price"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h2 className="card-title">Set Health</h2>
+              <p className="text-sm opacity-70">
+                Computes the WETH price needed to hit a target HF (linear in collateral price) and sets it.
+              </p>
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input input-bordered"
+                placeholder="target HF (e.g. 1.20)"
+                value={targetHf}
+                onChange={e => setTargetHf(e.target.value)}
+              />
+              <div className="card-actions justify-end">
+                <button
+                  className="btn btn-secondary"
+                  disabled={pricePending || !targetHf || !hf}
+                  onClick={handleSetHealth}
+                >
+                  Set Health
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h2 className="card-title">Set Yield Token Price</h2>
+              <p className="text-sm opacity-70">
+                Pushes the PYUSD↔mYLD pool to a new price (slot0 override). V3PoolPriceSource picks it up
+                automatically.
+              </p>
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input input-bordered"
+                value={yieldPriceUsd}
+                onChange={e => setYieldPriceUsd(e.target.value)}
+              />
+              <div className="card-actions justify-end">
+                <button
+                  className="btn btn-secondary"
+                  disabled={!yieldPriceUsd || !yieldPoolAddr}
+                  onClick={handleSetYieldPrice}
+                >
+                  Set Price
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="card bg-base-100 shadow-xl">
+            <div className="card-body">
+              <h2 className="card-title">Rebalance / Liquidate</h2>
+              <p className="text-sm opacity-70">
+                Rebalance is permissionless and pulls HF back into [1.10, 1.50]. Liquidate impersonates a 3rd-party that
+                calls Aave&apos;s liquidationCall — only succeeds if HF &lt; 1.
+              </p>
+              <div className="card-actions justify-end">
+                <button className="btn btn-error" onClick={handleLiquidate}>
+                  Liquidate
+                </button>
+                <button className="btn btn-accent" disabled={depositPending} onClick={handleRebalance}>
+                  Rebalance
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grow bg-base-300 w-full mt-10 px-8 py-8">
+        <div className="flex justify-center items-center gap-12 flex-col md:flex-row">
+          <div className="flex flex-col bg-base-100 px-10 py-6 text-center items-center max-w-xs rounded-3xl">
+            <BugAntIcon className="h-8 w-8 fill-secondary" />
+            <p>
+              Tinker with the vault using the{" "}
+              <Link href="/debug" passHref className="link">
+                Debug Contracts
+              </Link>{" "}
+              tab.
+            </p>
+          </div>
+          <div className="flex flex-col bg-base-100 px-10 py-6 text-center items-center max-w-xs rounded-3xl">
+            <MagnifyingGlassIcon className="h-8 w-8 fill-secondary" />
+            <p>
+              Explore local transactions with the{" "}
+              <Link href="/blockexplorer" passHref className="link">
+                Block Explorer
+              </Link>{" "}
+              tab.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Home;
