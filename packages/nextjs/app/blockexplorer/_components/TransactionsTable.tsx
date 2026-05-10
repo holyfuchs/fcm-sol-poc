@@ -14,6 +14,7 @@ export const TransactionsTable = ({ blocks, transactionReceipts }: TransactionsT
         <table className="table text-xl bg-base-100 table-zebra w-full md:table-md table-sm">
           <thead>
             <tr className="rounded-xl text-sm text-base-content">
+              <th className="bg-primary">Status</th>
               <th className="bg-primary">Transaction Hash</th>
               <th className="bg-primary">Function Called</th>
               <th className="bg-primary">Block Number</th>
@@ -30,8 +31,18 @@ export const TransactionsTable = ({ blocks, transactionReceipts }: TransactionsT
                 const timeMined = new Date(Number(block.timestamp) * 1000).toLocaleString();
                 const functionCalled = tx.input.substring(0, 10);
 
+                const reverted = receipt && receipt.status !== "success";
                 return (
-                  <tr key={tx.hash} className="hover text-sm">
+                  <tr key={tx.hash} className={`hover text-sm ${reverted ? "bg-error/10" : ""}`}>
+                    <td className="md:py-4">
+                      {receipt ? (
+                        <span className={`badge badge-sm ${reverted ? "badge-error" : "badge-success"}`}>
+                          {reverted ? "reverted" : "ok"}
+                        </span>
+                      ) : (
+                        <span className="badge badge-sm badge-ghost">…</span>
+                      )}
+                    </td>
                     <td className="w-1/12 md:py-4">
                       <TransactionHash hash={tx.hash} />
                     </td>

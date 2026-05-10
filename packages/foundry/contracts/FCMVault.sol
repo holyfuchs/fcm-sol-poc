@@ -246,6 +246,13 @@ contract FCMVault is ERC4626 {
         uint256 debtSlice  = IERC20(variableDebtToken).balanceOf(address(this))
             .mulDiv(shares, totalClaims, Math.Rounding.Ceil);
 
+        // No debt to repay (e.g. position was fully liquidated) → take the
+        // simple path: no flashloan, no debt repay, just withdraw collat and
+        // sell the yield slice for more collat.
+        if (debtSlice == 0) {
+            return simpleRedeem(shares, receiver, owner, collSlice, yieldSlice);
+        }
+
         IPool(AAVE_POOL).flashLoanSimple(
             address(this),
             BORROW_ASSET,
@@ -253,6 +260,38 @@ contract FCMVault is ERC4626 {
             abi.encode(collSlice, yieldSlice),
             0
         );
+
+        assets = IERC20(asset()).balanceOf(address(this));
+        _burn(owner, shares);
+        IERC20(asset()).safeTransfer(receiver, assets);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+    }
+
+    /// @notice Debt-free redeem path. Withdraws `collSlice` from Aave and
+    ///         swaps `yieldSlice` back into the underlying. No flashloan, no
+    ///         debt repayment. Used when the vault's on-Aave debt is 0 (post
+    ///         full-liquidation), where Aave's `flashLoanSimple(asset, 0)`
+    ///         and `withdraw(asset, 0)` would both revert.
+    /// @dev Internal — `redeem` dispatches here. Caller has already done the
+    ///      allowance check and the share<>slice math.
+    function simpleRedeem(
+        uint256 shares,
+        address receiver,
+        address owner,
+        uint256 collSlice,
+        uint256 yieldSlice
+    ) internal returns (uint256 assets) {
+        if (collSlice > 0) {
+            IPool(AAVE_POOL).withdraw(asset(), collSlice, address(this));
+        }
+        if (yieldSlice > 0) {
+            uint256 debtReceived =
+                _swapExactIn(address(yieldAsset), BORROW_ASSET, yieldSlice);
+            if (debtReceived > 0) {
+                _swapExactIn(BORROW_ASSET, asset(), debtReceived);
+            }
+        }
 
         assets = IERC20(asset()).balanceOf(address(this));
         _burn(owner, shares);
@@ -518,6 +557,9 @@ contract FCMVault is ERC4626 {
     ///      slippage via the downstream NAV math.
     function _swapDebtToYield() internal returns (uint256 yieldReceived) {
         uint256 bal = IERC20(BORROW_ASSET).balanceOf(address(this));
+        if (bal == 0) {
+            return 0;
+        }
         yieldReceived = _swapExactIn(BORROW_ASSET, address(yieldAsset), bal);
     }
 

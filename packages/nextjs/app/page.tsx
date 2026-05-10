@@ -36,10 +36,26 @@ const AAVE_ERRORS: Record<string, string> = {
   "47": "user didn't borrow that currency",
 };
 
+// Uniswap V3 / PunchSwap V3 short revert codes.
+const UNIV3_ERRORS: Record<string, string> = {
+  AS: "amountSpecified == 0 (swap with zero amount)",
+  AI: "pool already initialized",
+  L: "pool not initialized (slot0.sqrtPriceX96 == 0)",
+  LO: "tickLower out of range",
+  TLU: "tickLower > tickUpper",
+  TLM: "tick out of MIN/MAX bounds",
+  SPL: "sqrtPriceLimitX96 outside valid range",
+  IIA: "invalid input amount",
+  M0: "amount0Owed not paid in mint callback",
+  M1: "amount1Owed not paid in mint callback",
+};
+
 const explainError = (e: any): string => {
   const raw = e?.shortMessage ?? e?.cause?.shortMessage ?? e?.details ?? e?.message ?? String(e);
-  const m = raw.match(/reverted with the following reason:\s*(\d+)/);
-  if (m && AAVE_ERRORS[m[1]]) return `${raw}\n→ Aave: ${AAVE_ERRORS[m[1]]}`;
+  const num = raw.match(/reverted with the following reason:\s*(\d+)/);
+  if (num && AAVE_ERRORS[num[1]]) return `${raw}\n→ Aave: ${AAVE_ERRORS[num[1]]}`;
+  const str = raw.match(/reverted with the following reason:\s*([A-Z0-9]{1,4})\b/);
+  if (str && UNIV3_ERRORS[str[1]]) return `${raw}\n→ UniV3: ${UNIV3_ERRORS[str[1]]}`;
   return raw;
 };
 
@@ -270,11 +286,16 @@ const Home: NextPage = () => {
     ],
   });
 
+  // disableSimulate so reverting txs are actually broadcast and land on-chain
+  // — otherwise SE-2 simulates first and aborts client-side, and the failing
+  // tx never appears in the block explorer (no hash to inspect with cast run).
   const { writeContractAsync: writeVault, isPending: depositPending } = useScaffoldWriteContract({
     contractName: "FCMVault",
+    disableSimulate: true,
   });
   const { writeContractAsync: writePrice, isPending: pricePending } = useScaffoldWriteContract({
     contractName: "MockPriceSource",
+    disableSimulate: true,
   });
   const { writeContractAsync: writeErc20 } = useWriteContract();
   const publicClient = usePublicClient();
@@ -476,6 +497,7 @@ const Home: NextPage = () => {
       await writeVault({
         functionName: "deposit",
         args: [amount, connectedAddress],
+        gas: 5_000_000n,
       });
       notification.success("deposit complete");
       setDepositAmount("");
@@ -491,6 +513,7 @@ const Home: NextPage = () => {
       await writeVault({
         functionName: "redeem",
         args: [shares, connectedAddress, connectedAddress],
+        gas: 8_000_000n,
       });
       notification.success("redeem complete");
       setRedeemShares("");
@@ -530,6 +553,7 @@ const Home: NextPage = () => {
       await writePrice({
         functionName: "setPrice",
         args: [priceWith8Decimals],
+        gas: 200_000n,
       });
       await moveWethPool(priceFloat);
       notification.success(`WETH price → $${wethPriceUsd}`);
@@ -561,6 +585,7 @@ const Home: NextPage = () => {
       await writePrice({
         functionName: "setPrice",
         args: [newPrice],
+        gas: 200_000n,
       });
       const newPriceUsd = Number(newPrice) / 1e8;
       await moveWethPool(newPriceUsd);
@@ -573,7 +598,7 @@ const Home: NextPage = () => {
 
   const handleRebalance = async () => {
     try {
-      await writeVault({ functionName: "rebalance" });
+      await writeVault({ functionName: "rebalance", gas: 5_000_000n });
       notification.success("rebalanced");
     } catch (e: any) {
       notification.error(explainError(e) ?? "rebalance failed");

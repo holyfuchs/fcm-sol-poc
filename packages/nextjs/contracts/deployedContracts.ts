@@ -7,7 +7,7 @@ import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 const deployedContracts = {
   31337: {
     MockYieldToken: {
-      address: "0x700b6a60ce7eaaea56f065753d8dcb9653dbad35",
+      address: "0x05b4cb126885fb10464fdd12666feb25e2563b76",
       abi: [
         {
           type: "constructor",
@@ -358,10 +358,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 65042813,
+      deployedOnBlock: 65044132,
     },
     MockPriceSource: {
-      address: "0xa15bb66138824a1c7167f5e85b957d04dd34e468",
+      address: "0x2a264f26859166c5bf3868a54593ee716aebc848",
       abi: [
         {
           type: "constructor",
@@ -428,10 +428,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 65042813,
+      deployedOnBlock: 65044131,
     },
     V3PoolHelper: {
-      address: "0xb19b36b1456e65e3a6d514d3f715f204bd59f431",
+      address: "0xd04ff4a75edd737a73e92b2f2274cb887d96e110",
       abi: [
         {
           type: "constructor",
@@ -532,10 +532,10 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 65042814,
+      deployedOnBlock: 65044132,
     },
     FCMVault: {
-      address: "0x8ce361602b935680e8dec218b820ff5056beb7af",
+      address: "0xc6b8fbf96cf7bbe45576417ec2163acecfa88ecc",
       abi: [
         {
           type: "constructor",
@@ -1769,7 +1769,7 @@ const deployedContracts = {
         },
       ],
       inheritedFunctions: {},
-      deployedOnBlock: 65042814,
+      deployedOnBlock: 65044133,
     },
   },
 } as const;
