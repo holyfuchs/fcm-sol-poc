@@ -7,3 +7,6 @@
 [submodule "packages/foundry/lib/aave-v3-core"]
 	path = packages/foundry/lib/aave-v3-core
 	url = https://github.com/aave/aave-v3-core
+[submodule "packages/foundry/lib/morpho-blue"]
+	path = packages/foundry/lib/morpho-blue
+	url = https://github.com/morpho-org/morpho-blue

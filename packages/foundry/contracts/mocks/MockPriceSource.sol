@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
 /// @notice Minimal Chainlink-style price source for AaveOracle. The Aave oracle
 ///         only reads `latestAnswer()`. Price is publicly settable so the demo

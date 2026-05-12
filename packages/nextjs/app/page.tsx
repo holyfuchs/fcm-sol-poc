@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Address } from "@scaffold-ui/components";
 import type { NextPage } from "next";
-import { encodeAbiParameters, formatUnits, keccak256, pad, parseUnits, toHex } from "viem";
+import { encodeAbiParameters, encodeFunctionData, formatUnits, keccak256, pad, parseUnits, toHex } from "viem";
 import { useAccount, usePublicClient, useReadContracts, useWriteContract } from "wagmi";
 import { BugAntIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
 import deployedContracts from "~~/contracts/deployedContracts";
@@ -61,10 +61,10 @@ const explainError = (e: any): string => {
 
 const WETH = "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590" as const;
 const PYUSD = "0x99aF3EeA856556646C98c8B9b2548Fe815240750" as const;
-const AAVE_POOL = "0xbC92aaC2DBBF42215248B5688eB3D3d2b32F2c8d" as const;
-const AAVE_ORACLE = "0x7287f12c268d7Dff22AAa5c2AA242D7640041cB1" as const;
-const PUNCH_FACTORY = "0xf331959366032a634c7cAcF5852fE01ffdB84Af0" as const;
-const POOL_FEE = 3000;
+const SWAP_FACTORY = "0xca6d7Bb03334bBf135902e1d919a5feccb461632" as const;
+// FlowSwap V3 fee tiers — different per pair.
+const FEE_YIELD_DEBT = 100; // 0.01% — YIELD/PYUSD0
+const FEE_DEBT_COLL = 3000; // 0.30% — WETH/PYUSD0
 
 const factoryAbi = [
   {
@@ -77,33 +77,6 @@ const factoryAbi = [
       { name: "fee", type: "uint24" },
     ],
     outputs: [{ name: "pool", type: "address" }],
-  },
-] as const;
-
-const aaveOracleAbi = [
-  {
-    type: "function",
-    name: "getAssetPrice",
-    stateMutability: "view",
-    inputs: [{ name: "asset", type: "address" }],
-    outputs: [{ name: "", type: "uint256" }],
-  },
-] as const;
-
-const aavePoolAbi = [
-  {
-    type: "function",
-    name: "getUserAccountData",
-    stateMutability: "view",
-    inputs: [{ name: "user", type: "address" }],
-    outputs: [
-      { name: "totalCollateralBase", type: "uint256" },
-      { name: "totalDebtBase", type: "uint256" },
-      { name: "availableBorrowsBase", type: "uint256" },
-      { name: "currentLiquidationThreshold", type: "uint256" },
-      { name: "ltv", type: "uint256" },
-      { name: "healthFactor", type: "uint256" },
-    ],
   },
 ] as const;
 
@@ -244,20 +217,24 @@ const Home: NextPage = () => {
     args: [shareBalance],
   });
 
-  const { data: aTokenAddr } = useScaffoldReadContract({
-    contractName: "FCMVault",
-    functionName: "aToken",
-  });
-
-  const { data: debtTokenAddr } = useScaffoldReadContract({
-    contractName: "FCMVault",
-    functionName: "variableDebtToken",
-  });
-
   const { data: yieldAssetAddr } = useScaffoldReadContract({
     contractName: "FCMVault",
     functionName: "yieldAsset",
   });
+
+  const wethSrcAddr = deployedContracts[31337].WethPriceSource?.address as `0x${string}` | undefined;
+  const pyusdSrcAddr = deployedContracts[31337].Pyusd0PriceSource?.address as `0x${string}` | undefined;
+  const v3SrcAddr = deployedContracts[31337].V3PoolPriceSource?.address as `0x${string}` | undefined;
+
+  const aggregatorAbi = [
+    {
+      type: "function",
+      name: "latestAnswer",
+      stateMutability: "view",
+      inputs: [],
+      outputs: [{ type: "int256" }],
+    },
+  ] as const;
 
   const { data: stats } = useReadContracts({
     allowFailure: true,
@@ -265,24 +242,54 @@ const Home: NextPage = () => {
     contracts: [
       // 0: WETH balance of user
       { address: WETH, abi: erc20Abi, functionName: "balanceOf", args: [connectedAddress!] },
-      // 1: collateral (aToken bal of vault) — equals collateral value in WETH
-      { address: aTokenAddr, abi: erc20Abi, functionName: "balanceOf", args: [vaultAddr] },
-      // 2: debt (debtToken bal of vault) — in PYUSD (6 dec)
-      { address: debtTokenAddr, abi: erc20Abi, functionName: "balanceOf", args: [vaultAddr] },
-      // 3: yield bal of vault — in mYLD (18 dec)
+      // 1: vault collateral (WETH on Morpho)
+      { address: vaultAddr, abi: deployedContracts[31337].FCMVault.abi, functionName: "collateral" },
+      // 2: vault debt (PYUSD0)
+      { address: vaultAddr, abi: deployedContracts[31337].FCMVault.abi, functionName: "debt" },
+      // 3: yield bal of vault
       { address: yieldAssetAddr, abi: erc20Abi, functionName: "balanceOf", args: [vaultAddr] },
-      // 4: oracle price of WETH (1e8 base)
-      { address: AAVE_ORACLE, abi: aaveOracleAbi, functionName: "getAssetPrice", args: [WETH] },
-      // 5: oracle price of PYUSD
-      { address: AAVE_ORACLE, abi: aaveOracleAbi, functionName: "getAssetPrice", args: [PYUSD] },
-      // 6: oracle price of yield asset
-      { address: AAVE_ORACLE, abi: aaveOracleAbi, functionName: "getAssetPrice", args: [yieldAssetAddr!] },
-      // 7: aave HF (index 5 of tuple)
-      { address: AAVE_POOL, abi: aavePoolAbi, functionName: "getUserAccountData", args: [vaultAddr] },
-      // 8: PYUSD↔WETH pool address
-      { address: PUNCH_FACTORY, abi: factoryAbi, functionName: "getPool", args: [WETH, PYUSD, POOL_FEE] },
-      // 9: PYUSD↔mYLD pool address
-      { address: PUNCH_FACTORY, abi: factoryAbi, functionName: "getPool", args: [yieldAssetAddr!, PYUSD, POOL_FEE] },
+      // 4: WETH price (1e8 base)
+      { address: wethSrcAddr, abi: aggregatorAbi, functionName: "latestAnswer" },
+      // 5: PYUSD0 price (1e8)
+      { address: pyusdSrcAddr, abi: aggregatorAbi, functionName: "latestAnswer" },
+      // 6: yield price (1e8, from V3 pool)
+      { address: v3SrcAddr, abi: aggregatorAbi, functionName: "latestAnswer" },
+      // 7: vault health factor (1e18, type(uint256).max if no debt)
+      { address: vaultAddr, abi: deployedContracts[31337].FCMVault.abi, functionName: "healthFactor" },
+      // 8: PYUSD0↔WETH pool address (for slot0-override "Set Price" buttons)
+      { address: SWAP_FACTORY, abi: factoryAbi, functionName: "getPool", args: [WETH, PYUSD, FEE_DEBT_COLL] },
+      // 9: PYUSD0↔yield pool address
+      {
+        address: SWAP_FACTORY,
+        abi: factoryAbi,
+        functionName: "getPool",
+        args: [yieldAssetAddr!, PYUSD, FEE_YIELD_DEBT],
+      },
+      // 10: yield-token decimals
+      {
+        address: yieldAssetAddr,
+        abi: [
+          { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] },
+        ] as const,
+        functionName: "decimals",
+      },
+    ],
+  });
+
+  const yieldPoolAddrEarly = stats?.[9]?.result as `0x${string}` | undefined;
+  const yieldDecimalsRead = stats?.[10]?.result as number | undefined;
+
+  const { data: poolStats } = useReadContracts({
+    allowFailure: true,
+    query: {
+      refetchInterval: 4000,
+      enabled: !!yieldPoolAddrEarly && !!yieldAssetAddr,
+    },
+    contracts: [
+      // 0: PYUSD reserve of the yield pool
+      { address: PYUSD, abi: erc20Abi, functionName: "balanceOf", args: [yieldPoolAddrEarly!] },
+      // 1: yield-token reserve of the pool
+      { address: yieldAssetAddr, abi: erc20Abi, functionName: "balanceOf", args: [yieldPoolAddrEarly!] },
     ],
   });
 
@@ -294,7 +301,7 @@ const Home: NextPage = () => {
     disableSimulate: true,
   });
   const { writeContractAsync: writePrice, isPending: pricePending } = useScaffoldWriteContract({
-    contractName: "MockPriceSource",
+    contractName: "WethPriceSource",
     disableSimulate: true,
   });
   const { writeContractAsync: writeErc20 } = useWriteContract();
@@ -392,6 +399,7 @@ const Home: NextPage = () => {
 
   const handleLiquidate = async () => {
     if (!publicClient) return;
+    const morphoAddr = deployedContracts[31337].Morpho.address as `0x${string}`;
     try {
       // Impersonate + fund with native gas.
       await publicClient.request({
@@ -403,7 +411,7 @@ const Home: NextPage = () => {
         params: [LIQUIDATOR, "0x56BC75E2D63100000"] as any,
       });
 
-      // Fund liquidator with PYUSD via storage write (slot 1, 1M PYUSD).
+      // Fund liquidator with PYUSD0 via storage write (slot 1, 1M).
       const slot = 1n;
       const key = keccak256(encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [LIQUIDATOR, slot]));
       const target = pad(toHex(parseUnits("1000000", 6)), { size: 32 });
@@ -412,32 +420,53 @@ const Home: NextPage = () => {
         params: [PYUSD, key, target] as any,
       });
 
-      // approve(AAVE_POOL, max) on PYUSD — selector 095ea7b3
-      const approveData = "0x095ea7b3" + AAVE_POOL.slice(2).padStart(64, "0").toLowerCase() + "f".repeat(64);
+      // approve(Morpho, max) on PYUSD0
+      const approveData = "0x095ea7b3" + morphoAddr.slice(2).padStart(64, "0").toLowerCase() + "f".repeat(64);
       await publicClient.request({
         method: "eth_sendTransaction" as any,
         params: [{ from: LIQUIDATOR, to: PYUSD, data: approveData, gas: "0x186a0" }] as any,
       });
 
-      // liquidationCall(WETH, PYUSD, vault, type(uint256).max, false)
-      // selector = 00a718a9
-      const liqData =
-        "0x00a718a9" +
-        WETH.slice(2).padStart(64, "0").toLowerCase() +
-        PYUSD.slice(2).padStart(64, "0").toLowerCase() +
-        vaultAddr.slice(2).padStart(64, "0").toLowerCase() +
-        "f".repeat(64) +
-        "0".repeat(64);
-      const txHash = (await publicClient.request({
-        method: "eth_sendTransaction" as any,
-        params: [{ from: LIQUIDATOR, to: AAVE_POOL, data: liqData, gas: "0xf42400" }] as any,
+      // Read the vault's current marketParams + borrowShares so we know what
+      // to pass to morpho.liquidate. We seize the full position by passing
+      // `repaidShares = position.borrowShares` (and seizedAssets = 0).
+      const mp = (await publicClient.readContract({
+        address: vaultAddr,
+        abi: deployedContracts[31337].FCMVault.abi,
+        functionName: "marketParams",
+      })) as {
+        loanToken: `0x${string}`;
+        collateralToken: `0x${string}`;
+        oracle: `0x${string}`;
+        irm: `0x${string}`;
+        lltv: bigint;
+      };
+
+      const marketId = (await publicClient.readContract({
+        address: vaultAddr,
+        abi: deployedContracts[31337].FCMVault.abi,
+        functionName: "marketId",
       })) as `0x${string}`;
 
-      // Wait for the receipt and check the status — eth_sendTransaction
-      // returns the hash even if the tx will revert.
-      const receipt = await publicClient.waitForTransactionReceipt({
-        hash: txHash,
+      const position = (await publicClient.readContract({
+        address: morphoAddr,
+        abi: deployedContracts[31337].Morpho.abi,
+        functionName: "position",
+        args: [marketId, vaultAddr],
+      })) as readonly [bigint, bigint, bigint]; // (supplyShares, borrowShares, collateral)
+      const borrowShares = position[1];
+
+      const liqData = encodeFunctionData({
+        abi: deployedContracts[31337].Morpho.abi,
+        functionName: "liquidate",
+        args: [mp, vaultAddr, 0n, borrowShares, "0x"],
       });
+      const txHash = (await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: LIQUIDATOR, to: morphoAddr, data: liqData, gas: "0xf42400" }] as any,
+      })) as `0x${string}`;
+
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
 
       await publicClient.request({
         method: "anvil_stopImpersonatingAccount" as any,
@@ -445,9 +474,8 @@ const Home: NextPage = () => {
       });
 
       if (receipt.status !== "success") {
-        throw new Error("liquidationCall reverted (HF likely ≥ 1)");
+        throw new Error("morpho.liquidate reverted (HF likely ≥ 1)");
       }
-
       notification.success("liquidation succeeded");
     } catch (e: any) {
       try {
@@ -614,19 +642,26 @@ const Home: NextPage = () => {
   const pColl = stats?.[4]?.result as bigint | undefined; // 1e8
   const pDebt = stats?.[5]?.result as bigint | undefined; // 1e8
   const pYield = stats?.[6]?.result as bigint | undefined; // 1e8
-  const accountData = stats?.[7]?.result as readonly bigint[] | undefined;
-  const hf = accountData?.[5];
+  const hf = stats?.[7]?.result as bigint | undefined;
   const wethPoolAddr = stats?.[8]?.result as `0x${string}` | undefined;
-  const yieldPoolAddr = stats?.[9]?.result as `0x${string}` | undefined;
+  const yieldPoolAddr = yieldPoolAddrEarly;
+  const yieldDecimals = yieldDecimalsRead ?? 18;
+  const poolPyusd = poolStats?.[0]?.result as bigint | undefined;
+  const poolYield = poolStats?.[1]?.result as bigint | undefined;
 
   // debt (PYUSD, 6 dec) → WETH (18 dec): debt * pDebt * 1e12 / pColl
   const debtInColl = debtAmount && pDebt && pColl && pColl > 0n ? (debtAmount * pDebt * 10n ** 12n) / pColl : undefined;
-  // yield (mYLD, 18 dec) → WETH (18 dec): yield * pYield / pColl
-  const yieldInColl = yieldAmount && pYield && pColl && pColl > 0n ? (yieldAmount * pYield) / pColl : undefined;
+  // yield (yieldDecimals) → WETH (18 dec): yield × pYield × 10^(18-yieldDec) / pColl
+  const yieldInColl =
+    yieldAmount && pYield && pColl && pColl > 0n
+      ? (yieldAmount * pYield * 10n ** BigInt(18 - yieldDecimals)) / pColl
+      : undefined;
 
   const yieldPriceUsdFmt = pYield ? (Number(pYield) / 1e8).toFixed(4) : "—";
   const wethPriceUsdFmt = pColl ? (Number(pColl) / 1e8).toFixed(2) : "—";
-  const hfFmt = hf ? Number(formatUnits(hf, 18)).toFixed(3) : "—";
+  // `vault.healthFactor()` returns type(uint256).max when there's no debt — render as "∞".
+  const hfInfinite = hf !== undefined && hf > 10n ** 50n;
+  const hfFmt = hf === undefined ? "—" : hfInfinite ? "∞" : Number(formatUnits(hf, 18)).toFixed(3);
 
   // Sync the WETH price input with the on-chain value once we have it.
   useEffect(() => {
@@ -667,14 +702,22 @@ const Home: NextPage = () => {
               />
               <Stat
                 label="Yield"
-                value={`${fmtUnits(yieldAmount, 18)} mYLD`}
+                value={`${fmtUnits(yieldAmount, yieldDecimals)} yield`}
                 sub={`= ${fmtUnits(yieldInColl, 18)} WETH`}
               />
               <Stat
                 label="Health"
                 value={hfFmt}
                 tone={
-                  !hf ? undefined : hf < parseUnits("1.1", 18) ? "danger" : hf > parseUnits("1.5", 18) ? "warn" : "ok"
+                  !hf
+                    ? undefined
+                    : hfInfinite
+                      ? "ok"
+                      : hf < parseUnits("1.1", 18)
+                        ? "danger"
+                        : hf > parseUnits("1.5", 18)
+                          ? "warn"
+                          : "ok"
                 }
               />
               <Stat label="Yield Token Price" value={`$${yieldPriceUsdFmt}`} />
@@ -690,11 +733,26 @@ const Home: NextPage = () => {
           </div>
         </div>
 
+        <div className="card bg-base-100 shadow-xl mb-6">
+          <div className="card-body">
+            <h3 className="card-title">Yield Pool (PYUSD ↔ yield)</h3>
+            <Stat
+              label="Pool"
+              value={yieldPoolAddr ? `${yieldPoolAddr.slice(0, 6)}…${yieldPoolAddr.slice(-4)}` : "—"}
+            />
+            <Stat label="Price" value={`$${yieldPriceUsdFmt} per yield`} />
+            <Stat label="Depth (PYUSD)" value={`${fmtUnits(poolPyusd, 6)} PYUSD`} />
+            <Stat label="Depth (yield)" value={`${fmtUnits(poolYield, yieldDecimals)} yield`} />
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
           <div className="card bg-base-100 shadow-xl">
             <div className="card-body">
               <h2 className="card-title">Deposit</h2>
-              <p className="text-sm opacity-70">Approve + deposit WETH. Vault levers it up via Aave + PunchSwap V3.</p>
+              <p className="text-sm opacity-70">
+                Approve + deposit WETH. Vault levers it up via Morpho Blue + FlowSwap V3.
+              </p>
               <input
                 type="text"
                 inputMode="decimal"
@@ -754,7 +812,8 @@ const Home: NextPage = () => {
             <div className="card-body">
               <h2 className="card-title">Set Collateral (WETH) Price</h2>
               <p className="text-sm opacity-70">
-                Overrides the AaveOracle source for WETH. Moves the vault&apos;s Aave health factor directly.
+                Writes a new WETH/USD price into the WethPriceSource. Moves the vault&apos;s health factor directly
+                (Morpho market reads this same source).
               </p>
               <input
                 type="text"
@@ -834,7 +893,7 @@ const Home: NextPage = () => {
               <h2 className="card-title">Rebalance / Liquidate</h2>
               <p className="text-sm opacity-70">
                 Rebalance is permissionless and pulls HF back into [1.10, 1.50]. Liquidate impersonates a 3rd-party that
-                calls Aave&apos;s liquidationCall — only succeeds if HF &lt; 1.
+                calls Morpho&apos;s liquidate — only succeeds if HF &lt; 1.
               </p>
               <div className="card-actions justify-end">
                 <button className="btn btn-error" onClick={handleLiquidate}>

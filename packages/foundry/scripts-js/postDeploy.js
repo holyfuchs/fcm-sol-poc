@@ -4,7 +4,7 @@
 // `forge script` deploys the contracts but cannot do the things that require
 // privileged accounts on the fork: granting the deployer the Aave PoolAdmin
 // role, swapping in our MockPriceSource for the yield token, funding the
-// deployer with WETH/PYUSD, and seeding the two PunchSwap V3 pools.
+// deployer with WETH/PYUSD, and seeding the two FlowSwap V3 pools.
 // All of that lives here and runs against anvil's RPC via cheatcodes.
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
@@ -20,8 +20,9 @@ const DEPLOYER_PK =
 
 const WETH  = "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590";
 const PYUSD = "0x99aF3EeA856556646C98c8B9b2548Fe815240750";
-const PUNCH_FACTORY = "0xf331959366032a634c7cAcF5852fE01ffdB84Af0";
-const POOL_FEE = 3000;
+const YIELD_TOKEN = "0xd069d989e2F44B70c65347d1853C0c67e10a9F8D";
+const SWAP_FACTORY = "0xca6d7Bb03334bBf135902e1d919a5feccb461632"; // FlowSwap V3 Core Factory
+const POOL_FEE = 100; // 0.01%
 
 const erc20Abi = [
   "function balanceOf(address) view returns (uint256)",
@@ -54,6 +55,10 @@ const oracleAbi = [
 
 const factoryAbi = [
   "function getPool(address,address,uint24) view returns (address)",
+];
+
+const v3PoolAbi = [
+  "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool)",
 ];
 
 const mockSourceAbi = [
@@ -122,140 +127,64 @@ async function main() {
   }
   console.log("deployments:", addrs);
 
-  const vault = new ethers.Contract(
+  // Sanity-check the live PYUSD0↔YIELD pool we depend on.
+  const factory = new ethers.Contract(SWAP_FACTORY, factoryAbi, provider);
+  const yieldPoolAddr = await factory.getPool(PYUSD, YIELD_TOKEN, POOL_FEE);
+  if (yieldPoolAddr === ethers.constants.AddressZero) {
+    throw new Error(
+      `PYUSD0↔YIELD pool not found on FlowSwap V3 factory ${SWAP_FACTORY}`
+    );
+  }
+  const slot0 = await new ethers.Contract(yieldPoolAddr, v3PoolAbi, provider).slot0();
+  if (slot0.sqrtPriceX96.isZero()) {
+    throw new Error(`PYUSD0↔YIELD pool ${yieldPoolAddr} is not initialised`);
+  }
+  console.log(`yield pool: ${yieldPoolAddr} (read live, never seeded)`);
+
+  console.log("\nfunding deployer with WETH");
+  const wethTarget = ethers.utils.parseUnits("10", 18);
+  await setErc20Balance(provider, WETH, deployer.address, wethTarget);
+  const remainingWeth = await new ethers.Contract(WETH, erc20Abi, provider).balanceOf(deployer.address);
+  console.log(`deployer WETH balance: ${ethers.utils.formatEther(remainingWeth)}`);
+
+  // Seed the Morpho market with PYUSD0 supply so the vault has loan-token
+  // liquidity to borrow against. Use a dedicated "lender" address so the
+  // deployer is only ever a borrower in the demo.
+  console.log("\nseeding Morpho market with PYUSD0 supply (1M)");
+  const LENDER = "0x000000000000000000000000000000000000d0d0";
+  await rpc(provider, "anvil_impersonateAccount", [LENDER]);
+  await rpc(provider, "anvil_setBalance", [LENDER, "0x56BC75E2D63100000"]);
+  const supplyAmount = ethers.utils.parseUnits("1000000", 6);
+  await setErc20Balance(provider, PYUSD, LENDER, supplyAmount);
+
+  // Read marketParams from the vault — single source of truth.
+  const vaultC = new ethers.Contract(
     addrs.FCMVault,
     [
-      ...poolAbi,
-      "function AAVE_POOL() view returns (address)",
-      "function AAVE_ORACLE() view returns (address)",
+      "function marketParams() view returns (tuple(address loanToken, address collateralToken, address oracle, address irm, uint256 lltv))",
     ],
     provider
   );
-  const aavePool = await vault.AAVE_POOL();
-  const aaveOracle = await vault.AAVE_ORACLE();
-  const poolC = new ethers.Contract(aavePool, poolAbi, provider);
-  const addrProviderAddr = await poolC.ADDRESSES_PROVIDER();
-  const addrProvider = new ethers.Contract(addrProviderAddr, providerAbi, provider);
-  const aclManagerAddr = await addrProvider.getACLManager();
-  const aclAdminAddr = await addrProvider.getACLAdmin();
+  const mp = await vaultC.marketParams();
 
-  console.log("aave pool:    ", aavePool);
-  console.log("aave oracle:  ", aaveOracle);
-  console.log("acl admin:    ", aclAdminAddr);
-  console.log("acl manager:  ", aclManagerAddr);
-
-  // 1. Impersonate the Aave ACL admin and grant the deployer PoolAdmin so the
-  //    deployer can call `setAssetSources` on the oracle.
-  console.log("\n[1/5] granting deployer PoolAdmin role");
-  await impersonate(provider, aclAdminAddr);
-  const adminSigner = provider.getSigner(aclAdminAddr);
-  const aclAsAdmin = new ethers.Contract(aclManagerAddr, aclAbi, adminSigner);
-  const isAdmin = await aclAsAdmin.isPoolAdmin(deployer.address);
-  if (!isAdmin) {
-    const tx = await aclAsAdmin.addPoolAdmin(deployer.address);
-    await tx.wait();
-  }
-  await stop(provider, aclAdminAddr);
-
-  // 2. Fund deployer with WETH and PYUSD via storage overwrite.
-  console.log("\n[2/5] funding deployer with WETH + PYUSD");
-  const wethTarget  = ethers.utils.parseUnits("200", 18);   // covers pool seed + buffer
-  const pyusdTarget = ethers.utils.parseUnits("1300000", 6); // ~1.3M PYUSD
-  await setErc20Balance(provider, WETH,  deployer.address, wethTarget);
-  await setErc20Balance(provider, PYUSD, deployer.address, pyusdTarget);
-
-  // 3. Mint mYLD, approve V3PoolHelper, seed the two pools.
-  console.log("\n[3/5] seeding PunchSwap V3 pools");
-  const yieldToken = new ethers.Contract(addrs.MockYieldToken, erc20Abi, deployer);
-  const weth       = new ethers.Contract(WETH,  erc20Abi, deployer);
-  const pyusd      = new ethers.Contract(PYUSD, erc20Abi, deployer);
-  const yieldMint  = ethers.utils.parseUnits("1100000", 18); // 1.1M mYLD (with buffer)
-  await (await yieldToken.mint(deployer.address, yieldMint)).wait();
-
-  const max = ethers.constants.MaxUint256;
-  await (await yieldToken.approve(addrs.V3PoolHelper, max)).wait();
-  await (await weth.approve(addrs.V3PoolHelper, max)).wait();
-  await (await pyusd.approve(addrs.V3PoolHelper, max)).wait();
-
-  const helper = new ethers.Contract(addrs.V3PoolHelper, helperAbi, deployer);
-
-  //   PYUSD ↔ mYLD: 1 PYUSD = 1 mYLD  → 1M PYUSD : 1M mYLD (initial yield price = $1).
-  console.log("  seeding PYUSD↔mYLD");
-  await (
-    await helper.createAndFundPool(
-      PYUSD,
-      addrs.MockYieldToken,
-      POOL_FEE,
-      ethers.utils.parseUnits("1000000", 6),
-      ethers.utils.parseUnits("1000000", 18)
-    )
-  ).wait();
-
-  //   PYUSD ↔ WETH: 1 WETH ≈ 2344 PYUSD → 234.4k PYUSD : 100 WETH
-  console.log("  seeding PYUSD↔WETH");
-  await (
-    await helper.createAndFundPool(
-      PYUSD,
-      WETH,
-      POOL_FEE,
-      ethers.utils.parseUnits("234400", 6),
-      ethers.utils.parseUnits("100", 18)
-    )
-  ).wait();
-
-  // 4. Deploy V3PoolPriceSource for the yield token (reads PYUSD↔mYLD pool).
-  console.log("\n[4/5] deploying V3PoolPriceSource for yield token");
-  const factory = new ethers.Contract(PUNCH_FACTORY, factoryAbi, provider);
-  const yieldPoolAddr = await factory.getPool(
+  const lenderSigner = provider.getSigner(LENDER);
+  const pyusdAsLender = new ethers.Contract(
     PYUSD,
-    addrs.MockYieldToken,
-    POOL_FEE
+    ["function approve(address,uint256) returns (bool)"],
+    lenderSigner
   );
-  console.log("  PYUSD↔mYLD pool:", yieldPoolAddr);
+  await (await pyusdAsLender.approve(addrs.Morpho, ethers.constants.MaxUint256)).wait();
 
-  const v3SrcArtifact = JSON.parse(
-    readFileSync(
-      join(__dirname, "..", "out", "V3PoolPriceSource.sol", "V3PoolPriceSource.json"),
-      "utf8"
-    )
+  const morphoAsLender = new ethers.Contract(
+    addrs.Morpho,
+    [
+      "function supply(tuple(address loanToken, address collateralToken, address oracle, address irm, uint256 lltv) marketParams, uint256 assets, uint256 shares, address onBehalf, bytes data) returns (uint256, uint256)",
+    ],
+    lenderSigner
   );
-  const v3SrcFactory = new ethers.ContractFactory(
-    v3SrcArtifact.abi,
-    v3SrcArtifact.bytecode.object,
-    deployer
-  );
-  const v3Source = await v3SrcFactory.deploy(
-    yieldPoolAddr,
-    addrs.MockYieldToken,
-    PYUSD,
-    aaveOracle
-  );
-  await v3Source.deployed();
-  console.log("  V3PoolPriceSource:", v3Source.address);
-
-  // 5. Seed MockPriceSource with the current Aave WETH price, then override
-  //    the AaveOracle sources: WETH → MockPriceSource (settable),
-  //    mYLD → V3PoolPriceSource (derived from pool).
-  console.log("\n[5/5] overriding AaveOracle sources");
-  const oracle = new ethers.Contract(aaveOracle, oracleAbi, deployer);
-  const wethPriceNow = await oracle.getAssetPrice(WETH);
-  console.log(`  current WETH price: $${(Number(wethPriceNow) / 1e8).toFixed(2)}`);
-
-  const mockSource = new ethers.Contract(addrs.MockPriceSource, mockSourceAbi, deployer);
-  await (await mockSource.setPrice(wethPriceNow)).wait();
-
-  await (
-    await oracle.setAssetSources(
-      [WETH, addrs.MockYieldToken],
-      [addrs.MockPriceSource, v3Source.address]
-    )
-  ).wait();
-
-  const yieldPriceNow = await oracle.getAssetPrice(addrs.MockYieldToken);
-  console.log(`  yield price (from pool): $${(Number(yieldPriceNow) / 1e8).toFixed(4)}`);
-
-  const remainingWeth = await weth.balanceOf(deployer.address);
-  console.log(`\ndeployer WETH balance: ${ethers.utils.formatEther(remainingWeth)}`);
+  await (await morphoAsLender.supply(mp, supplyAmount, 0, LENDER, "0x")).wait();
+  await rpc(provider, "anvil_stopImpersonatingAccount", [LENDER]);
+  console.log(`  lender ${LENDER} supplied ${ethers.utils.formatUnits(supplyAmount, 6)} PYUSD0`);
 
   // Snapshot the post-deploy chain state so the frontend's "Reset chain"
   // button can revert here without a full redeploy.
