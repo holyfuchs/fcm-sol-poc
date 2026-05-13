@@ -18,6 +18,33 @@ interface IChainlinkAggregator {
     function latestAnswer() external view returns (int256);
 }
 
+interface IAllowlist {
+    function isAllowed(address account) external view returns (bool);
+}
+
+interface IQuoterV2 {
+    struct QuoteExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+    struct QuoteExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amount;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
+    function quoteExactInputSingle(QuoteExactInputSingleParams memory params)
+        external
+        returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
+    function quoteExactOutputSingle(QuoteExactOutputSingleParams memory params)
+        external
+        returns (uint256 amountIn, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
+}
+
 /// @title FCMVault
 /// @notice ERC-4626 vault on Morpho Blue. Three-leg leveraged position:
 ///         1. Collateral leg: WETH supplied to a Morpho market.
@@ -34,6 +61,7 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
     // ---- Hardcoded Flow EVM config -------------------------------------
 
     address public constant SWAP_ROUTER = 0xeEDC6Ff75e1b10B903D9013c358e446a73d35341; // FlowSwap V3 SwapRouter02
+    address public constant QUOTER      = 0x370A8DF17742867a44e56223EC20D82092242C85; // FlowSwap V3 QuoterV2
     uint24  public constant FEE_YIELD_DEBT = 100;    // PYUSD0/YIELD pool
     uint24  public constant FEE_DEBT_COLL  = 3000;   // WETH/PYUSD0 pool
 
@@ -42,14 +70,34 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
 
     uint256 internal constant BPS_DENOM = 10_000;
 
-    uint256 public constant HF_LOWER_THRESHOLD = 1.10e18;
-    uint256 public constant HF_LOWER_TARGET    = 1.15e18;
-    uint256 public constant HF_UPPER_TARGET    = 1.45e18;
-    uint256 public constant HF_UPPER_THRESHOLD = 1.50e18;
+    /// Health-factor band, all 1e18-scaled. Set at construction. `rebalance()`
+    /// pulls the position back to the matching target when the current HF
+    /// crosses a threshold.
+    uint256 public immutable hfLowerThreshold;
+    uint256 public immutable hfLowerTarget;
+    uint256 public immutable hfUpperTarget;
+    uint256 public immutable hfUpperThreshold;
 
-    uint256 public constant MAX_SWAP_SLIPPAGE_BPS      = 3000; // 30%
+    /// Per-swap price-impact budget during `rebalance()`, vs the oracle-derived
+    ///       expected amount. Set at construction (immutable). 1e4-scaled bps.
+    uint256 public immutable maxSwapSlippageBps;
+
     uint256 public constant MAX_REBALANCE_SLIPPAGE_BPS = 50;   // 0.5%
-    uint256 public constant MAX_TVL = 100e18;
+    // ---- Admin-settable parameters -------------------------------------
+
+    /// @notice Admin EOA. Set to the deployer at construction. Can adjust
+    ///         `maxTvl` and transfer ownership.
+    address public owner;
+
+    /// @notice TVL cap, denominated in the underlying (WETH). Deposits revert
+    ///         if `totalAssets() + assets > maxTvl`. Default 0 → no deposits
+    ///         until admin raises it.
+    uint256 public maxTvl;
+
+    event OwnerSet(address indexed previousOwner, address indexed newOwner);
+    event MaxTvlSet(uint256 previousMaxTvl, uint256 newMaxTvl);
+
+    error NotOwner();
 
     uint8 internal constant DECIMALS_OFFSET = 6;
 
@@ -68,47 +116,95 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
     address public immutable debtPriceOracle;
     address public immutable yieldOracle;
 
+    /// External allowlist contract gating `deposit`. Anyone not in the
+    /// allowlist gets reverted with `NotAllowed()`.
+    IAllowlist public immutable allowlist;
+
     // ---- Yield leg -----------------------------------------------------
 
     IERC20 public immutable yieldAsset;
     uint8  public immutable yieldDecimals;
 
-    constructor(
-        IERC20 underlying_,
-        IERC20 yieldAsset_,
-        uint8 yieldDecimals_,
-        address yieldOracle_,
-        address collateralPriceOracle_,
-        address debtPriceOracle_,
-        IMorpho morpho_,
-        MarketParams memory marketParams_,
-        string memory name_,
-        string memory symbol_
-    )
-        ERC20(name_, symbol_)
-        ERC4626(underlying_)
+    error NotAllowed();
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    /// @notice Set the TVL cap. Default at deploy time is 0 (no deposits).
+    function setMaxTvl(uint256 newMaxTvl) external onlyOwner {
+        emit MaxTvlSet(maxTvl, newMaxTvl);
+        maxTvl = newMaxTvl;
+    }
+
+    /// @notice Hand ownership to another address. Pass `address(0)` to renounce.
+    function transferOwnership(address newOwner) external onlyOwner {
+        emit OwnerSet(owner, newOwner);
+        owner = newOwner;
+    }
+
+    struct InitParams {
+        IERC20 underlying;
+        IERC20 yieldAsset;
+        uint8 yieldDecimals;
+        address yieldOracle;
+        address collateralPriceOracle;
+        address debtPriceOracle;
+        IMorpho morpho;
+        MarketParams marketParams;
+        IAllowlist allowlist;
+        uint256 maxSwapSlippageBps;
+        uint256 hfLowerThreshold;
+        uint256 hfLowerTarget;
+        uint256 hfUpperTarget;
+        uint256 hfUpperThreshold;
+        string name;
+        string symbol;
+    }
+
+    constructor(InitParams memory p)
+        ERC20(p.name, p.symbol)
+        ERC4626(p.underlying)
     {
-        require(marketParams_.collateralToken == address(underlying_), "underlying != collateral");
+        require(p.marketParams.collateralToken == address(p.underlying), "underlying != collateral");
+        require(p.maxSwapSlippageBps <= BPS_DENOM, "slippage > 100%");
+        require(
+            p.hfLowerThreshold < p.hfLowerTarget
+                && p.hfLowerTarget < p.hfUpperTarget
+                && p.hfUpperTarget < p.hfUpperThreshold,
+            "bad HF band"
+        );
+        maxSwapSlippageBps = p.maxSwapSlippageBps;
+        hfLowerThreshold   = p.hfLowerThreshold;
+        hfLowerTarget      = p.hfLowerTarget;
+        hfUpperTarget      = p.hfUpperTarget;
+        hfUpperThreshold   = p.hfUpperThreshold;
 
-        morpho       = morpho_;
-        marketId     = marketParams_.id();
-        loanToken    = marketParams_.loanToken;
-        marketOracle = marketParams_.oracle;
-        marketIrm    = marketParams_.irm;
-        marketLltv   = marketParams_.lltv;
+        morpho       = p.morpho;
+        marketId     = p.marketParams.id();
+        loanToken    = p.marketParams.loanToken;
+        marketOracle = p.marketParams.oracle;
+        marketIrm    = p.marketParams.irm;
+        marketLltv   = p.marketParams.lltv;
 
-        yieldAsset            = yieldAsset_;
-        yieldDecimals         = yieldDecimals_;
-        yieldOracle           = yieldOracle_;
-        collateralPriceOracle = collateralPriceOracle_;
-        debtPriceOracle       = debtPriceOracle_;
+        allowlist             = p.allowlist;
+        owner                 = msg.sender;
+        emit OwnerSet(address(0), msg.sender);
+        // maxTvl defaults to 0 — admin must call setMaxTvl before any deposits.
 
-        uint256 max = type(uint256).max;
-        underlying_.forceApprove(address(morpho_), max);
-        IERC20(loanToken).forceApprove(address(morpho_), max);
-        IERC20(loanToken).forceApprove(SWAP_ROUTER, max);
-        underlying_.forceApprove(SWAP_ROUTER, max);
-        yieldAsset_.forceApprove(SWAP_ROUTER, max);
+        yieldAsset            = p.yieldAsset;
+        yieldDecimals         = p.yieldDecimals;
+        yieldOracle           = p.yieldOracle;
+        collateralPriceOracle = p.collateralPriceOracle;
+        debtPriceOracle       = p.debtPriceOracle;
+
+        uint256 m = type(uint256).max;
+        p.underlying.forceApprove(address(p.morpho), m);
+        IERC20(loanToken).forceApprove(address(p.morpho), m);
+        IERC20(loanToken).forceApprove(SWAP_ROUTER, m);
+        p.underlying.forceApprove(SWAP_ROUTER, m);
+        p.yieldAsset.forceApprove(SWAP_ROUTER, m);
     }
 
     // ======================== ERC4626 plumbing ========================
@@ -132,10 +228,131 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
         return 0;
     }
 
-    function previewDeposit(uint256) public pure override returns (uint256) { revert("not implemented"); }
-    function previewMint(uint256)    public pure override returns (uint256) { revert("use deposit"); }
-    function previewRedeem(uint256)  public pure override returns (uint256) { revert("not implemented"); }
+    /// @notice ERC-4626 previews are disabled — they cannot model the swap
+    ///         slippage that actual `deposit` / `redeem` incur. Use the
+    ///         non-view `simulateDeposit` / `simulateRedeem` below for an
+    ///         accurate quote via the QuoterV2 (callable via eth_call).
+    function previewDeposit(uint256)  public pure override returns (uint256) { revert("use simulateDeposit"); }
+    function previewMint(uint256)     public pure override returns (uint256) { revert("use deposit"); }
+    function previewRedeem(uint256)   public pure override returns (uint256) { revert("use simulateRedeem"); }
     function previewWithdraw(uint256) public pure override returns (uint256) { revert("not implemented"); }
+
+    /// @notice Slippage-accurate preview of how many shares a `deposit(assets)`
+    ///         would mint. Calls QuoterV2 to price the debt→yield swap that
+    ///         happens internally during deposit. Non-view (Quoter is non-view)
+    ///         — call via eth_call (no broadcast).
+    function simulateDeposit(uint256 assets) external returns (uint256 shares) {
+        uint256 navBefore = totalAssets();
+        (uint256 borrowed, uint256 currentDebt) = _simulateBorrow(assets);
+        uint256 quotedYield = _quoteDebtToYield(borrowed);
+        uint256 navAfter = _projectedNav(assets, currentDebt + borrowed, quotedYield);
+        if (navAfter <= navBefore) return 0;
+        shares = (navAfter - navBefore).mulDiv(_totalClaims(), navBefore + 1);
+    }
+
+    /// @dev Borrow-sizing math from `_leverNewCollateral`. Returns the borrow
+    ///      amount and the current debt (for use in the projected NAV calc).
+    function _simulateBorrow(uint256 assets) internal view returns (uint256 borrowed, uint256 currentDebt) {
+        uint256 capByNew =
+            _collateralToDebt(assets).mulDiv(marketLltv, 1e18).mulDiv(1e18, hfUpperTarget);
+        uint256 targetDebt =
+            _collateralToDebt(_collateral() + assets).mulDiv(marketLltv, 1e18).mulDiv(1e18, hfUpperTarget);
+        currentDebt = _debtAssets();
+        uint256 deltaCap = targetDebt > currentDebt ? targetDebt - currentDebt : 0;
+        borrowed = capByNew < deltaCap ? capByNew : deltaCap;
+    }
+
+    function _quoteDebtToYield(uint256 debtIn) internal returns (uint256) {
+        if (debtIn == 0) return 0;
+        (uint256 out,,,) = IQuoterV2(QUOTER).quoteExactInputSingle(IQuoterV2.QuoteExactInputSingleParams({
+            tokenIn: loanToken,
+            tokenOut: address(yieldAsset),
+            amountIn: debtIn,
+            fee: FEE_YIELD_DEBT,
+            sqrtPriceLimitX96: 0
+        }));
+        return out;
+    }
+
+    /// @dev Post-deposit NAV at oracle prices given the new collateral, total
+    ///      projected debt, and the quoted yield added to the existing yield bal.
+    function _projectedNav(uint256 newAssets, uint256 newDebt, uint256 quotedYield) internal view returns (uint256) {
+        uint256 newCollat = _collateral() + newAssets;
+        uint256 newYield  = yieldAsset.balanceOf(address(this)) + quotedYield;
+        uint256 gross     = newCollat + _yieldToCollateral(newYield);
+        uint256 debtColl  = _debtToCollateral(newDebt);
+        return gross > debtColl ? gross - debtColl : 0;
+    }
+
+    /// @notice Slippage-accurate preview of how much underlying a
+    ///         `redeem(shares)` would pay out. Calls QuoterV2 for the
+    ///         yield→debt and any debt↔underlying reconcile leg. Non-view —
+    ///         call via eth_call.
+    function simulateRedeem(uint256 shares) external returns (uint256 assets) {
+        uint256 totalClaims = _totalClaims();
+        Position memory pos = morpho.position(marketId, address(this));
+        Market memory mkt   = morpho.market(marketId);
+
+        uint256 collSlice  = uint256(pos.collateral).mulDiv(shares, totalClaims);
+        uint256 yieldSlice = yieldAsset.balanceOf(address(this)).mulDiv(shares, totalClaims);
+        uint256 debtSliceShares = uint256(pos.borrowShares).mulDiv(shares, totalClaims, Math.Rounding.Ceil);
+        if (debtSliceShares > pos.borrowShares) debtSliceShares = pos.borrowShares;
+
+        // Price the yield → loanToken sell (used in both paths).
+        uint256 debtReceived;
+        if (yieldSlice > 0) {
+            (debtReceived,,,) = IQuoterV2(QUOTER).quoteExactInputSingle(IQuoterV2.QuoteExactInputSingleParams({
+                tokenIn: address(yieldAsset),
+                tokenOut: loanToken,
+                amountIn: yieldSlice,
+                fee: FEE_YIELD_DEBT,
+                sqrtPriceLimitX96: 0
+            }));
+        }
+
+        if (debtSliceShares == 0) {
+            // simpleRedeem path: yield → loanToken → asset, plus collSlice.
+            uint256 wethOut;
+            if (debtReceived > 0) {
+                (wethOut,,,) = IQuoterV2(QUOTER).quoteExactInputSingle(IQuoterV2.QuoteExactInputSingleParams({
+                    tokenIn: loanToken,
+                    tokenOut: asset(),
+                    amountIn: debtReceived,
+                    fee: FEE_DEBT_COLL,
+                    sqrtPriceLimitX96: 0
+                }));
+            }
+            return collSlice + wethOut;
+        }
+
+        // Flashloan path. flashAssets = what we need to repay.
+        uint256 flashAssets = debtSliceShares.toAssetsUp(mkt.totalBorrowAssets, mkt.totalBorrowShares);
+
+        if (debtReceived > flashAssets) {
+            uint256 surplus = debtReceived - flashAssets;
+            uint256 wethBonus;
+            (wethBonus,,,) = IQuoterV2(QUOTER).quoteExactInputSingle(IQuoterV2.QuoteExactInputSingleParams({
+                tokenIn: loanToken,
+                tokenOut: asset(),
+                amountIn: surplus,
+                fee: FEE_DEBT_COLL,
+                sqrtPriceLimitX96: 0
+            }));
+            return collSlice + wethBonus;
+        } else if (debtReceived < flashAssets) {
+            uint256 deficit = flashAssets - debtReceived;
+            uint256 wethCost;
+            (wethCost,,,) = IQuoterV2(QUOTER).quoteExactOutputSingle(IQuoterV2.QuoteExactOutputSingleParams({
+                tokenIn: asset(),
+                tokenOut: loanToken,
+                amount: deficit,
+                fee: FEE_DEBT_COLL,
+                sqrtPriceLimitX96: 0
+            }));
+            return collSlice > wethCost ? collSlice - wethCost : 0;
+        }
+        return collSlice;
+    }
     function mint(uint256, address)  public pure override returns (uint256) { revert("use deposit"); }
     function maxMint(address)        public pure override returns (uint256) { return 0; }
     function withdraw(uint256, address, address) public pure override returns (uint256) { revert("use redeem"); }
@@ -147,7 +364,10 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
         override
         returns (uint256 shares)
     {
-        require(totalAssets() + assets <= MAX_TVL, "tvl cap exceeded");
+        // Gate on the share recipient (router-friendly: receiver is the user
+        // even when msg.sender is the Yearn router).
+        if (!allowlist.isAllowed(receiver)) revert NotAllowed();
+        require(totalAssets() + assets <= maxTvl, "tvl cap exceeded");
 
         // Snapshot NAV-before with free underlying = 0 (the vault never holds
         // underlying outside Morpho between external calls).
@@ -273,17 +493,17 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
         uint256 navBefore = totalAssets();
         uint256 hf = _healthFactor();
 
-        if (hf > HF_UPPER_THRESHOLD) {
-            uint256 toBorrow = _debtDeltaToReachHF(HF_UPPER_TARGET);
+        if (hf > hfUpperThreshold) {
+            uint256 toBorrow = _debtDeltaToReachHf(hfUpperTarget);
             morpho.borrow(_marketParams(), toBorrow, 0, address(this), address(this));
             uint256 expected = _debtToYield(toBorrow);
-            uint256 minOut = expected.mulDiv(BPS_DENOM - MAX_SWAP_SLIPPAGE_BPS, BPS_DENOM);
+            uint256 minOut = expected.mulDiv(BPS_DENOM - maxSwapSlippageBps, BPS_DENOM);
             uint256 received = _swapExactIn(loanToken, address(yieldAsset), toBorrow);
             require(received >= minOut, "rebalance swap slippage");
-        } else if (hf < HF_LOWER_THRESHOLD) {
-            uint256 toRepay = _debtDeltaToReachHF(HF_LOWER_TARGET);
+        } else if (hf < hfLowerThreshold) {
+            uint256 toRepay = _debtDeltaToReachHf(hfLowerTarget);
             uint256 expected = _debtToYield(toRepay);
-            uint256 maxIn = expected.mulDiv(BPS_DENOM + MAX_SWAP_SLIPPAGE_BPS, BPS_DENOM);
+            uint256 maxIn = expected.mulDiv(BPS_DENOM + maxSwapSlippageBps, BPS_DENOM);
             _swapExactOut(address(yieldAsset), loanToken, toRepay, maxIn);
             morpho.repay(_marketParams(), toRepay, 0, address(this), "");
         }
@@ -346,7 +566,7 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
         return maxBorrow.mulDiv(1e18, d);
     }
 
-    function _debtDeltaToReachHF(uint256 targetHf) internal view returns (uint256) {
+    function _debtDeltaToReachHf(uint256 targetHf) internal view returns (uint256) {
         uint256 collValInDebt = _collateralToDebt(_collateral());
         uint256 maxBorrow = collValInDebt.mulDiv(marketLltv, 1e18);
         uint256 targetDebt = maxBorrow.mulDiv(1e18, targetHf);
@@ -358,10 +578,10 @@ contract FCMVault is ERC4626, IMorphoFlashLoanCallback {
         if (newCollateral == 0) return 0;
 
         uint256 newCollValInDebt = _collateralToDebt(newCollateral);
-        uint256 capByNew = newCollValInDebt.mulDiv(marketLltv, 1e18).mulDiv(1e18, HF_UPPER_TARGET);
+        uint256 capByNew = newCollValInDebt.mulDiv(marketLltv, 1e18).mulDiv(1e18, hfUpperTarget);
 
         uint256 collValInDebt = _collateralToDebt(_collateral());
-        uint256 targetDebt = collValInDebt.mulDiv(marketLltv, 1e18).mulDiv(1e18, HF_UPPER_TARGET);
+        uint256 targetDebt = collValInDebt.mulDiv(marketLltv, 1e18).mulDiv(1e18, hfUpperTarget);
         uint256 currentDebt = _debtAssets();
         uint256 deltaCap = targetDebt > currentDebt ? targetDebt - currentDebt : 0;
 

@@ -17,10 +17,16 @@ chain: setup-anvil-wallet
 fork: setup-anvil-wallet
 	anvil --fork-url ${FORK_URL} --chain-id 31337
 
-# Deploy the contracts
+# Deploy the contracts. We split into three forge scripts because the libs we
+# depend on pin incompatible pragmas (Morpho =0.8.19, Yearn Router =0.8.18,
+# OZ V5 ERC4626 ^0.8.24). Each script is its own compilation unit so forge
+# picks a different solc per stage. Stage 3 reads stage-1 addresses from
+# deployments/<chainId>.json.
+DEPLOY_SCRIPTS = script/DeployMorpho.s.sol script/DeployRouter.s.sol script/DeployFCMVault.s.sol
+
 deploy:
-	@if [ ! -f "$(DEPLOY_SCRIPT)" ]; then 		echo "Error: Deploy script '$(DEPLOY_SCRIPT)' not found"; 		exit 1; 	fi
-	@if [ "$(RPC_URL)" = "localhost" ]; then 		if [ "$(ETH_KEYSTORE_ACCOUNT)" = "scaffold-eth-default" ]; then 			forge script $(DEPLOY_SCRIPT) --rpc-url localhost --password localhost --broadcast --ffi; 		else 			forge script $(DEPLOY_SCRIPT) --rpc-url localhost --broadcast --ffi; 		fi 	else 		forge script $(DEPLOY_SCRIPT) --rpc-url $(RPC_URL) --broadcast --ffi; 	fi
+	@rm -f deployments/$$(cast chain-id --rpc-url $${RPC_URL:-localhost} 2>/dev/null || echo 31337).json
+	@for s in $(DEPLOY_SCRIPTS); do 		echo "▶ $$s"; 		if [ "$(RPC_URL)" = "localhost" ]; then 			if [ "$(ETH_KEYSTORE_ACCOUNT)" = "scaffold-eth-default" ]; then 				forge script $$s --rpc-url localhost --password localhost --broadcast --ffi || exit 1; 			else 				forge script $$s --rpc-url localhost --broadcast --ffi || exit 1; 			fi; 		else 			forge script $$s --rpc-url $(RPC_URL) --broadcast --ffi || exit 1; 		fi; 	done
 	@if [ -z "$(RPC_URL)" ] || [ "$(RPC_URL)" = "localhost" ]; then 		node scripts-js/postDeploy.js; 	fi
 
 # Deploy and generate ABIs

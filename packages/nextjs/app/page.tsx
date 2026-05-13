@@ -197,6 +197,11 @@ const Home: NextPage = () => {
   const [wethPriceUsd, setWethPriceUsd] = useState("");
   const [targetHf, setTargetHf] = useState("1.20");
   const [yieldPriceUsd, setYieldPriceUsd] = useState("1.00");
+  // Acceptable slippage from `simulateDeposit` / `simulateRedeem` preview.
+  // 0.5 means "revert if the realised outcome is more than 0.5% worse than the preview".
+  const [slippagePct, setSlippagePct] = useState("0.5");
+  const [newMaxTvl, setNewMaxTvl] = useState("100");
+  const [allowlistInput, setAllowlistInput] = useState("");
 
   const vaultAddr = deployedContracts[31337].FCMVault.address as `0x${string}`;
 
@@ -221,6 +226,69 @@ const Home: NextPage = () => {
     contractName: "FCMVault",
     functionName: "yieldAsset",
   });
+
+  const { data: maxTvl } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "maxTvl",
+  });
+
+  const { data: vaultOwner } = useScaffoldReadContract({
+    contractName: "FCMVault",
+    functionName: "owner",
+  });
+
+  const { data: isUserAllowed, refetch: refetchAllowed } = useScaffoldReadContract({
+    contractName: "Allowlist",
+    functionName: "isAllowed",
+    args: [connectedAddress],
+  });
+
+  const isAdmin = !!connectedAddress && !!vaultOwner && connectedAddress.toLowerCase() === vaultOwner.toLowerCase();
+
+  // Parsed input → bigint, used for the previewDeposit / previewRedeem calls below.
+  const depositPreviewIn = (() => {
+    if (!depositAmount) return undefined;
+    try {
+      return parseUnits(depositAmount, 18);
+    } catch {
+      return undefined;
+    }
+  })();
+  const redeemPreviewIn = (() => {
+    if (!redeemShares) return undefined;
+    try {
+      return parseUnits(redeemShares, 18);
+    } catch {
+      return undefined;
+    }
+  })();
+
+  // simulateDeposit / simulateRedeem are non-view (they call QuoterV2). Call
+  // them via eth_call (useReadContracts works for that — wagmi's TS narrows
+  // by mutability, but at the RPC level eth_call accepts anything).
+  const { data: simResults } = useReadContracts({
+    allowFailure: true,
+    query: {
+      enabled: depositPreviewIn !== undefined || redeemPreviewIn !== undefined,
+      refetchInterval: 0,
+    },
+    contracts: [
+      {
+        address: vaultAddr,
+        abi: deployedContracts[31337].FCMVault.abi,
+        functionName: "simulateDeposit",
+        args: depositPreviewIn !== undefined ? [depositPreviewIn] : undefined,
+      },
+      {
+        address: vaultAddr,
+        abi: deployedContracts[31337].FCMVault.abi,
+        functionName: "simulateRedeem",
+        args: redeemPreviewIn !== undefined ? [redeemPreviewIn] : undefined,
+      },
+    ],
+  });
+  const depositPreview = simResults?.[0]?.result as bigint | undefined;
+  const redeemPreview = simResults?.[1]?.result as bigint | undefined;
 
   const wethSrcAddr = deployedContracts[31337].WethPriceSource?.address as `0x${string}` | undefined;
   const pyusdSrcAddr = deployedContracts[31337].Pyusd0PriceSource?.address as `0x${string}` | undefined;
@@ -346,6 +414,15 @@ const Home: NextPage = () => {
     try {
       const amount = parseUnits(depositAmount, 18);
 
+      // Allowlist OTHER_USER first (must be admin to do this). Vault gates
+      // deposit on `allowlist.isAllowed(receiver)`.
+      notification.info("allowlisting other user...");
+      await writeAllowlist({
+        functionName: "set",
+        args: [OTHER_USER, true],
+        gas: 100_000n,
+      });
+
       await publicClient.request({
         method: "anvil_impersonateAccount" as any,
         params: [OTHER_USER] as any,
@@ -393,6 +470,194 @@ const Home: NextPage = () => {
           params: [OTHER_USER] as any,
         });
       } catch {}
+      notification.error(explainError(e));
+    }
+  };
+
+  const { writeContractAsync: writeVaultAdmin } = useScaffoldWriteContract({
+    contractName: "FCMVault",
+    disableSimulate: true,
+  });
+  const { writeContractAsync: writeAllowlist } = useScaffoldWriteContract({
+    contractName: "Allowlist",
+    disableSimulate: true,
+  });
+
+  const handleSetMaxTvl = async () => {
+    try {
+      const v = parseUnits(newMaxTvl || "0", 18);
+      await writeVaultAdmin({ functionName: "setMaxTvl", args: [v], gas: 100_000n });
+      notification.success(`maxTvl → ${newMaxTvl} WETH`);
+    } catch (e: any) {
+      notification.error(explainError(e));
+    }
+  };
+
+  const handleAllowlistAdd = async () => {
+    const addr = (allowlistInput || "").trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+      notification.error("invalid address");
+      return;
+    }
+    try {
+      await writeAllowlist({
+        functionName: "set",
+        args: [addr as `0x${string}`, true],
+        gas: 100_000n,
+      });
+      notification.success(`allowlisted ${addr.slice(0, 8)}…`);
+      refetchAllowed();
+    } catch (e: any) {
+      notification.error(explainError(e));
+    }
+  };
+
+  const handleAllowlistRemove = async () => {
+    const addr = (allowlistInput || "").trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+      notification.error("invalid address");
+      return;
+    }
+    try {
+      await writeAllowlist({
+        functionName: "set",
+        args: [addr as `0x${string}`, false],
+        gas: 100_000n,
+      });
+      notification.success(`removed ${addr.slice(0, 8)}…`);
+      refetchAllowed();
+    } catch (e: any) {
+      notification.error(explainError(e));
+    }
+  };
+
+  // One-click shortcut: impersonate the current vault owner and transfer
+  // ownership to the connected wallet. After this, admin actions (setMaxTvl,
+  // managing the allowlist when paired with the next button) can be done
+  // directly from the connected wallet.
+  const handleMakeMeAdmin = async () => {
+    if (!publicClient || !connectedAddress || !vaultOwner) return;
+    try {
+      await publicClient.request({
+        method: "anvil_impersonateAccount" as any,
+        params: [vaultOwner] as any,
+      });
+      await publicClient.request({
+        method: "anvil_setBalance" as any,
+        params: [vaultOwner, "0x56BC75E2D63100000"] as any,
+      });
+
+      const data = encodeFunctionData({
+        abi: deployedContracts[31337].FCMVault.abi,
+        functionName: "transferOwnership",
+        args: [connectedAddress],
+      });
+      const txHash = (await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: vaultOwner, to: vaultAddr, data, gas: "0x186a0" }] as any,
+      })) as `0x${string}`;
+      await publicClient.waitForTransactionReceipt({ hash: txHash });
+
+      await publicClient.request({
+        method: "anvil_stopImpersonatingAccount" as any,
+        params: [vaultOwner] as any,
+      });
+      notification.success("you are now the vault admin");
+    } catch (e: any) {
+      try {
+        await publicClient.request({
+          method: "anvil_stopImpersonatingAccount" as any,
+          params: [vaultOwner] as any,
+        });
+      } catch {}
+      notification.error(explainError(e));
+    }
+  };
+
+  // Allowlist admin is immutable (set to the deployer at Allowlist construction
+  // time). Impersonate the deployer to add the connected wallet.
+  const handleAllowlistMe = async () => {
+    if (!publicClient || !connectedAddress) return;
+    const allowlistAddr = deployedContracts[31337].Allowlist?.address as `0x${string}` | undefined;
+    if (!allowlistAddr) return;
+    try {
+      // Read current admin off the Allowlist contract.
+      const admin = (await publicClient.readContract({
+        address: allowlistAddr,
+        abi: deployedContracts[31337].Allowlist.abi,
+        functionName: "admin",
+      })) as `0x${string}`;
+
+      await publicClient.request({
+        method: "anvil_impersonateAccount" as any,
+        params: [admin] as any,
+      });
+      await publicClient.request({
+        method: "anvil_setBalance" as any,
+        params: [admin, "0x56BC75E2D63100000"] as any,
+      });
+
+      const data = encodeFunctionData({
+        abi: deployedContracts[31337].Allowlist.abi,
+        functionName: "set",
+        args: [connectedAddress, true],
+      });
+      const txHash = (await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: admin, to: allowlistAddr, data, gas: "0x186a0" }] as any,
+      })) as `0x${string}`;
+      await publicClient.waitForTransactionReceipt({ hash: txHash });
+
+      await publicClient.request({
+        method: "anvil_stopImpersonatingAccount" as any,
+        params: [admin] as any,
+      });
+      refetchAllowed();
+      notification.success("you are now allowlisted");
+    } catch (e: any) {
+      notification.error(explainError(e));
+    }
+  };
+
+  /// Mirror of `handleAllowlistMe` — remove the connected wallet from the allowlist.
+  const handleDeallowlistMe = async () => {
+    if (!publicClient || !connectedAddress) return;
+    const allowlistAddr = deployedContracts[31337].Allowlist?.address as `0x${string}` | undefined;
+    if (!allowlistAddr) return;
+    try {
+      const admin = (await publicClient.readContract({
+        address: allowlistAddr,
+        abi: deployedContracts[31337].Allowlist.abi,
+        functionName: "admin",
+      })) as `0x${string}`;
+
+      await publicClient.request({
+        method: "anvil_impersonateAccount" as any,
+        params: [admin] as any,
+      });
+      await publicClient.request({
+        method: "anvil_setBalance" as any,
+        params: [admin, "0x56BC75E2D63100000"] as any,
+      });
+
+      const data = encodeFunctionData({
+        abi: deployedContracts[31337].Allowlist.abi,
+        functionName: "set",
+        args: [connectedAddress, false],
+      });
+      const txHash = (await publicClient.request({
+        method: "eth_sendTransaction" as any,
+        params: [{ from: admin, to: allowlistAddr, data, gas: "0x186a0" }] as any,
+      })) as `0x${string}`;
+      await publicClient.waitForTransactionReceipt({ hash: txHash });
+
+      await publicClient.request({
+        method: "anvil_stopImpersonatingAccount" as any,
+        params: [admin] as any,
+      });
+      refetchAllowed();
+      notification.success("removed from allowlist");
+    } catch (e: any) {
       notification.error(explainError(e));
     }
   };
@@ -510,22 +775,44 @@ const Home: NextPage = () => {
     }
   };
 
+  // bps = round(pct × 100). 0.5% → 50 bps. Cap at 100% so the input doesn't underflow.
+  const slippageBps = (() => {
+    const f = parseFloat(slippagePct);
+    if (!isFinite(f) || f < 0) return 50n;
+    if (f >= 100) return 10000n;
+    return BigInt(Math.round(f * 100));
+  })();
+
+  // minOut = preview × (10_000 − slippageBps) / 10_000
+  const applySlippage = (preview: bigint): bigint => (preview * (10_000n - slippageBps)) / 10_000n;
+
+  // Yearn ERC-4626 Router — slippage-protected entry points. User approves
+  // the router (not the vault) for both WETH and vault shares; router pulls
+  // and forwards to the vault, then asserts minSharesOut / minAmountOut.
+  const routerAddr = deployedContracts[31337].Yearn4626Router?.address as `0x${string}` | undefined;
+
   const handleDeposit = async () => {
-    if (!depositAmount || !connectedAddress) return;
+    if (!depositAmount || !connectedAddress || !routerAddr) return;
+    if (depositPreview === undefined) {
+      notification.error("preview still loading — try again in a moment");
+      return;
+    }
     try {
       const amount = parseUnits(depositAmount, 18);
-      notification.info("approving WETH...");
+      const minSharesOut = applySlippage(depositPreview);
+      notification.info("approving WETH to router...");
       await writeErc20({
         address: WETH,
         abi: erc20Abi,
         functionName: "approve",
-        args: [vaultAddr, amount],
+        args: [routerAddr, amount],
       });
-      notification.info("depositing...");
-      await writeVault({
-        functionName: "deposit",
-        args: [amount, connectedAddress],
-        gas: 5_000_000n,
+      notification.info(`depositing via router (min ${fmtUnits(minSharesOut, 18)} shares)...`);
+      await writeErc20({
+        address: routerAddr,
+        abi: deployedContracts[31337].Yearn4626Router.abi,
+        functionName: "depositToVault",
+        args: [vaultAddr, amount, connectedAddress, minSharesOut],
       });
       notification.success("deposit complete");
       setDepositAmount("");
@@ -535,13 +822,32 @@ const Home: NextPage = () => {
   };
 
   const handleRedeem = async () => {
-    if (!redeemShares || !connectedAddress) return;
+    if (!redeemShares || !connectedAddress || !routerAddr) return;
+    if (redeemPreview === undefined) {
+      notification.error("preview still loading — try again in a moment");
+      return;
+    }
     try {
       const shares = parseUnits(redeemShares, 18);
-      await writeVault({
-        functionName: "redeem",
-        args: [shares, connectedAddress, connectedAddress],
-        gas: 8_000_000n,
+      const minAssetsOut = applySlippage(redeemPreview);
+
+      // Approve the router for vault shares — the router uses this allowance
+      // to call vault.redeem(shares, user, user); the vault burns the user's
+      // shares directly via _spendAllowance, no need to pull them to the router.
+      notification.info("approving shares to router...");
+      await writeErc20({
+        address: vaultAddr,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [routerAddr, shares],
+      });
+
+      notification.info(`redeeming via router (min ${fmtUnits(minAssetsOut, 18)} WETH)...`);
+      await writeErc20({
+        address: routerAddr,
+        abi: deployedContracts[31337].Yearn4626Router.abi,
+        functionName: "redeemDefault",
+        args: [vaultAddr, shares, connectedAddress, minAssetsOut],
       });
       notification.success("redeem complete");
       setRedeemShares("");
@@ -693,6 +999,7 @@ const Home: NextPage = () => {
             <div className="card-body">
               <h3 className="card-title">Vault</h3>
               <Stat label="TVL" value={`${fmtUnits(totalAssets, 18)} WETH`} />
+              <Stat label="TVL Cap" value={`${fmtUnits(maxTvl, 18)} WETH`} />
               <Stat label="WETH Price" value={`$${wethPriceUsdFmt}`} />
               <Stat label="Collateral" value={`${fmtUnits(collat, 18)} WETH`} />
               <Stat
@@ -746,6 +1053,86 @@ const Home: NextPage = () => {
           </div>
         </div>
 
+        <div className="card bg-base-100 shadow-xl mb-6">
+          <div className="card-body">
+            <h3 className="card-title">
+              Admin{" "}
+              {isAdmin ? (
+                <span className="badge badge-success badge-sm">you</span>
+              ) : (
+                <span className="badge badge-ghost badge-sm">not you</span>
+              )}
+            </h3>
+            <Stat label="Owner" value={vaultOwner ? `${vaultOwner.slice(0, 8)}…${vaultOwner.slice(-4)}` : "—"} />
+            <Stat
+              label="Your access"
+              value={isUserAllowed ? "allowlisted" : "NOT allowlisted"}
+              tone={isUserAllowed ? "ok" : "danger"}
+            />
+
+            <div className="flex flex-wrap gap-2 mt-2">
+              <button className="btn btn-xs btn-warning" disabled={isAdmin} onClick={handleMakeMeAdmin}>
+                Make me admin (devnet)
+              </button>
+              <button className="btn btn-xs btn-success" disabled={isUserAllowed} onClick={handleAllowlistMe}>
+                Allowlist me (devnet)
+              </button>
+              <button className="btn btn-xs btn-error" disabled={!isUserAllowed} onClick={handleDeallowlistMe}>
+                Remove me (devnet)
+              </button>
+            </div>
+
+            <div className="divider my-1" />
+
+            <label className="text-xs opacity-70">TVL cap (WETH)</label>
+            <div className="flex gap-2 items-center">
+              <input
+                type="text"
+                inputMode="decimal"
+                className="input input-bordered input-sm flex-1"
+                placeholder="e.g. 100"
+                value={newMaxTvl}
+                onChange={e => setNewMaxTvl(e.target.value)}
+              />
+              <button className="btn btn-sm btn-secondary" disabled={!isAdmin} onClick={handleSetMaxTvl}>
+                Set
+              </button>
+            </div>
+
+            <label className="text-xs opacity-70 mt-2">Allowlist address</label>
+            <div className="flex gap-2 items-center">
+              <input
+                type="text"
+                className="input input-bordered input-sm flex-1 font-mono text-xs"
+                placeholder="0x..."
+                value={allowlistInput}
+                onChange={e => setAllowlistInput(e.target.value)}
+              />
+              <button className="btn btn-sm btn-success" disabled={!isAdmin} onClick={handleAllowlistAdd}>
+                Add
+              </button>
+              <button className="btn btn-sm btn-error" disabled={!isAdmin} onClick={handleAllowlistRemove}>
+                Remove
+              </button>
+            </div>
+            {!isAdmin && (
+              <p className="text-xs opacity-60">Connect with the admin wallet to manage TVL cap and allowlist.</p>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 mb-2">
+          <label className="text-xs opacity-70">Max slippage (%)</label>
+          <input
+            type="text"
+            inputMode="decimal"
+            className="input input-bordered input-xs w-20 font-mono"
+            value={slippagePct}
+            onChange={e => setSlippagePct(e.target.value)}
+          />
+          <span className="text-xs opacity-50">vs preview</span>
+        </div>
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
           <div className="card bg-base-100 shadow-xl">
             <div className="card-body">
@@ -761,6 +1148,10 @@ const Home: NextPage = () => {
                 value={depositAmount}
                 onChange={e => setDepositAmount(e.target.value)}
               />
+              <p className="text-xs opacity-60 font-mono">
+                preview: {depositPreview !== undefined ? `${fmtUnits(depositPreview, 18)} shares` : "—"}
+                <span className="opacity-50"> (QuoterV2 simulated)</span>
+              </p>
               <div className="card-actions justify-between flex-wrap">
                 <button className="btn btn-ghost btn-sm" onClick={handleGetWeth}>
                   Get 10 WETH (devnet)
@@ -795,6 +1186,10 @@ const Home: NextPage = () => {
                 value={redeemShares}
                 onChange={e => setRedeemShares(e.target.value)}
               />
+              <p className="text-xs opacity-60 font-mono">
+                preview: {redeemPreview !== undefined ? `${fmtUnits(redeemPreview, 18)} WETH` : "—"}
+                <span className="opacity-50"> (QuoterV2 simulated)</span>
+              </p>
               <div className="card-actions justify-between">
                 <button className="btn btn-ghost btn-sm" onClick={handleSetMaxShares} disabled={!shareBalance}>
                   Max

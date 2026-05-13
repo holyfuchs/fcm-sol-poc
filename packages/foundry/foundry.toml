@@ -6,8 +6,20 @@ fs_permissions = [{ access = "read-write", path = "./"}]
 extra_output = ["evm.bytecode.opcodes"]
 optimizer = true
 optimizer_runs = 200
-via_ir = true
+via_ir = false
 
+[lint]
+# Disable cosmetic rules we deliberately don't follow:
+#  - screaming-snake-case-immutable: clashes with Morpho-ecosystem naming (`morpho`, `yieldAsset`, etc.)
+#  - mixed-case-variable: false positives on idiomatic constants like `Q192`
+#  - unsafe-typecast: our int256(uint256) casts on price feeds are intentional
+#  - mixed-case-function / unused-import / unaliased-plain-import inside DeployHelpers.s.sol
+#    are scaffold-eth defaults we don't own.
+exclude_lints = [
+    "screaming-snake-case-immutable",
+    "mixed-case-variable",
+    "unsafe-typecast",
+]
 
 [rpc_endpoints]
 default_network = "http://127.0.0.1:8545"

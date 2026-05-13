@@ -1,0 +1,20 @@
+{
+  "packages/foundry/lib/aave-v3-core": {
+    "rev": "b74526a7bc67a3a117a1963fc871b3eb8cea8435"
+  },
+  "packages/foundry/lib/forge-std": {
+    "rev": "620536fa5277db4e3fd46772d5cbc1ea0696fb43"
+  },
+  "packages/foundry/lib/morpho-blue": {
+    "rev": "55d2d99304fb3fb930c688462ae2ccabb1d533ad"
+  },
+  "packages/foundry/lib/openzeppelin-contracts": {
+    "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+  },
+  "packages/foundry/lib/uniswap-v3-static-quoter": {
+    "rev": "60e8c2c841e45d4ab50af10b56de605c02a1df09"
+  },
+  "packages/foundry/lib/v3-core": {
+    "rev": "e3589b192d0be27e100cd0daaf6c97204fdb1899"
+  }
+}

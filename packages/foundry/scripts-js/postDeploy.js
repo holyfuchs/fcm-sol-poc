@@ -186,6 +186,20 @@ async function main() {
   await rpc(provider, "anvil_stopImpersonatingAccount", [LENDER]);
   console.log(`  lender ${LENDER} supplied ${ethers.utils.formatUnits(supplyAmount, 6)} PYUSD0`);
 
+  // Yearn router pulls WETH from the depositor into itself, then calls
+  // vault.deposit which does `safeTransferFrom(router, vault)`. The router
+  // needs a standing allowance to the vault for that to work. `approve` is
+  // public on the router — anyone can call it; we just do it once here.
+  console.log("\napproving WETH router → vault");
+  const routerForApprove = new ethers.Contract(
+    addrs.Yearn4626Router,
+    ["function approve(address token, address to, uint256 amount) payable"],
+    deployer
+  );
+  await (
+    await routerForApprove.approve(WETH, addrs.FCMVault, ethers.constants.MaxUint256)
+  ).wait();
+
   // Snapshot the post-deploy chain state so the frontend's "Reset chain"
   // button can revert here without a full redeploy.
   const finalSnapshotId = await rpc(provider, "evm_snapshot", []);

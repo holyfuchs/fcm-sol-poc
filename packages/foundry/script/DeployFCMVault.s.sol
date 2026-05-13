@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "./DeployHelpers.s.sol";
+import { ScaffoldETHDeploy } from "./DeployHelpers.s.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-
-import {Morpho} from "@morpho-blue/Morpho.sol";
 import {IMorpho, MarketParams, Id} from "@morpho-blue/interfaces/IMorpho.sol";
-import {MarketParamsLib} from "@morpho-blue/libraries/MarketParamsLib.sol";
 
-import {FCMVault} from "../contracts/FCMVault.sol";
-import {WethPriceSource} from "../contracts/mocks/WethPriceSource.sol";
-import {Pyusd0PriceSource} from "../contracts/mocks/Pyusd0PriceSource.sol";
+import {FCMVault, IAllowlist} from "../contracts/FCMVault.sol";
+import {Allowlist} from "../contracts/Allowlist.sol";
 import {V3PoolPriceSource} from "../contracts/mocks/V3PoolPriceSource.sol";
-import {FixedRateIrm} from "../contracts/morpho/FixedRateIrm.sol";
-import {SimpleOracle} from "../contracts/morpho/SimpleOracle.sol";
 
 interface IERC20Decimals {
     function decimals() external view returns (uint8);
@@ -23,94 +17,127 @@ interface IUniswapV3Factory {
     function getPool(address, address, uint24) external view returns (address);
 }
 
-interface IAaveOracleMin {
-    function getAssetPrice(address asset) external view returns (uint256);
-}
-
-/// @notice One-shot deploy of the full FCM stack on a Flow EVM fork:
-///   - Morpho Blue singleton (owner = deployer)
-///   - FixedRateIrm at ~5% APR
-///   - MockPriceSources for WETH + PYUSD0 (settable; seeded with live Aave prices)
-///   - SimpleOracle for Morpho's market (wraps the two MockPriceSources)
-///   - WETH/PYUSD0 market on Morpho at 86% LLTV
-///   - V3PoolPriceSource for the yield token (reads FlowSwap V3 PYUSD0/YIELD)
-///   - FCMVault wired to all the above
+/// @notice Stage 3: deploys V3PoolPriceSource and FCMVault. Reads previously-
+///         deployed Morpho stack addresses from `deployments/<chainId>.json`
+///         (written by `DeployMorpho.s.sol`). Compiled with solc ≥0.8.20
+///         because of OZ V5 (ERC4626 needs ^0.8.24). Cannot share a compilation
+///         unit with Morpho.sol (=0.8.19) or Yearn4626Router (=0.8.18) —
+///         that's why those are in separate scripts.
 contract DeployFCMVault is ScaffoldETHDeploy {
-    using MarketParamsLib for MarketParams;
-
     address constant WETH         = 0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590;
     address constant PYUSD0       = 0x99aF3EeA856556646C98c8B9b2548Fe815240750;
     address constant AAVE_ORACLE  = 0x7287f12c268d7Dff22AAa5c2AA242D7640041cB1;
     address constant SWAP_FACTORY = 0xca6d7Bb03334bBf135902e1d919a5feccb461632;
     address constant YIELD_TOKEN  = 0xd069d989e2F44B70c65347d1853C0c67e10a9F8D;
 
-    uint8  constant WETH_DECIMALS   = 18;
-    uint8  constant PYUSD0_DECIMALS = 6;
-    uint24 constant FEE_YIELD_DEBT  = 100;
-
-    /// 86% LLTV (1e18-scaled).
+    uint24  constant FEE_YIELD_DEBT = 100;
     uint256 constant LLTV = 0.86e18;
-    /// 5% APR ≈ 5e16 / (365.25*86400) ≈ 1.585e9 per second, 1e18-scaled.
-    uint256 constant FIXED_RATE_PER_SECOND = 1585489599;
+    /// 30% max per-swap slippage during rebalance. Plenty of room for the demo.
+    uint256 constant MAX_SWAP_SLIPPAGE_BPS = 3000;
+    /// Health-factor band: rebalance lower-thresh → lower-target, upper-thresh → upper-target.
+    uint256 constant HF_LOWER_THRESHOLD = 1.10e18;
+    uint256 constant HF_LOWER_TARGET    = 1.15e18;
+    uint256 constant HF_UPPER_TARGET    = 1.45e18;
+    uint256 constant HF_UPPER_THRESHOLD = 1.50e18;
 
-    function run() external ScaffoldEthDeployerRunner {
-        // --- 1. WETH + PYUSD0 price sources (settable). Seed with live Aave prices.
-        uint256 livePColl = IAaveOracleMin(AAVE_ORACLE).getAssetPrice(WETH);
-        uint256 livePDebt = IAaveOracleMin(AAVE_ORACLE).getAssetPrice(PYUSD0);
-        WethPriceSource wethSource   = new WethPriceSource(int256(livePColl));
-        Pyusd0PriceSource pyusdSource = new Pyusd0PriceSource(int256(livePDebt));
+    struct Wired {
+        address morpho;
+        address irm;
+        address morphoOracle;
+        address wethSource;
+        address pyusdSource;
+    }
 
-        // --- 2. Morpho stack.
-        Morpho morpho = new Morpho(deployer);
-        FixedRateIrm irm = new FixedRateIrm(FIXED_RATE_PER_SECOND);
-        SimpleOracle morphoOracle = new SimpleOracle(
-            address(wethSource), address(pyusdSource), PYUSD0_DECIMALS, WETH_DECIMALS
-        );
-        morpho.enableIrm(address(irm));
-        morpho.enableLltv(LLTV);
+    function run() external scaffoldEthDeployerRunner {
+        Wired memory w = _loadMorphoStack();
 
-        MarketParams memory mp = MarketParams({
-            loanToken: PYUSD0,
-            collateralToken: WETH,
-            oracle: address(morphoOracle),
-            irm: address(irm),
-            lltv: LLTV
-        });
-        morpho.createMarket(mp);
+        Allowlist allowlistContract = new Allowlist();
+        allowlistContract.set(deployer, true);
 
-        // --- 3. Yield token oracle from the live FlowSwap V3 pool.
         address yieldPool =
             IUniswapV3Factory(SWAP_FACTORY).getPool(PYUSD0, YIELD_TOKEN, FEE_YIELD_DEBT);
         require(yieldPool != address(0), "PYUSD0/YIELD pool not found");
         V3PoolPriceSource yieldPriceSource =
             new V3PoolPriceSource(yieldPool, YIELD_TOKEN, PYUSD0, AAVE_ORACLE);
 
-        // --- 4. Vault.
-        uint8 yieldDecimals = IERC20Decimals(YIELD_TOKEN).decimals();
-        FCMVault vault = new FCMVault(
-            IERC20(WETH),
-            IERC20(YIELD_TOKEN),
-            yieldDecimals,
-            address(yieldPriceSource),
-            address(wethSource),
-            address(pyusdSource),
-            IMorpho(address(morpho)),
-            mp,
-            "Leveraged WETH",
-            "lvWETH"
-        );
+        FCMVault vault = _deployVault(w, yieldPriceSource, allowlistContract);
 
-        deployments.push(Deployment("Morpho",            address(morpho)));
-        deployments.push(Deployment("FixedRateIrm",      address(irm)));
-        deployments.push(Deployment("MorphoOracle",      address(morphoOracle)));
-        deployments.push(Deployment("WethPriceSource",   address(wethSource)));
-        deployments.push(Deployment("Pyusd0PriceSource", address(pyusdSource)));
-        deployments.push(Deployment("V3PoolPriceSource", address(yieldPriceSource)));
-        deployments.push(Deployment("FCMVault",          address(vault)));
-        // Market id (bytes32 → packed into an address slot for serialisation).
-        deployments.push(Deployment(
-            "MorphoMarketId",
-            address(uint160(uint256(Id.unwrap(mp.id()))))
-        ));
+        deployments.push(Deployment({name: "Allowlist",         addr: address(allowlistContract)}));
+        deployments.push(Deployment({name: "V3PoolPriceSource", addr: address(yieldPriceSource)}));
+        deployments.push(Deployment({name: "FCMVault",          addr: address(vault)}));
+    }
+
+    function _loadMorphoStack() internal view returns (Wired memory w) {
+        string memory path = string.concat(
+            vm.projectRoot(), "/deployments/", vm.toString(block.chainid), ".json"
+        );
+        require(vm.exists(path), "deployments json missing - run DeployMorpho first");
+        string memory j = vm.readFile(path);
+        w.morpho       = _findByName(j, "Morpho");
+        w.irm          = _findByName(j, "FixedRateIrm");
+        w.morphoOracle = _findByName(j, "MorphoOracle");
+        w.wethSource   = _findByName(j, "WethPriceSource");
+        w.pyusdSource  = _findByName(j, "Pyusd0PriceSource");
+    }
+
+    function _deployVault(Wired memory w, V3PoolPriceSource yieldPriceSource, Allowlist allowlistContract)
+        internal
+        returns (FCMVault)
+    {
+        MarketParams memory mp = MarketParams({
+            loanToken: PYUSD0,
+            collateralToken: WETH,
+            oracle: w.morphoOracle,
+            irm: w.irm,
+            lltv: LLTV
+        });
+        return new FCMVault(FCMVault.InitParams({
+            underlying:            IERC20(WETH),
+            yieldAsset:            IERC20(YIELD_TOKEN),
+            yieldDecimals:         IERC20Decimals(YIELD_TOKEN).decimals(),
+            yieldOracle:           address(yieldPriceSource),
+            collateralPriceOracle: w.wethSource,
+            debtPriceOracle:       w.pyusdSource,
+            morpho:                IMorpho(w.morpho),
+            marketParams:          mp,
+            allowlist:             IAllowlist(address(allowlistContract)),
+            maxSwapSlippageBps:    MAX_SWAP_SLIPPAGE_BPS,
+            hfLowerThreshold:      HF_LOWER_THRESHOLD,
+            hfLowerTarget:         HF_LOWER_TARGET,
+            hfUpperTarget:         HF_UPPER_TARGET,
+            hfUpperThreshold:      HF_UPPER_THRESHOLD,
+            name:                  "Leveraged WETH",
+            symbol:                "lvWETH"
+        }));
+    }
+
+    /// @dev Linear scan over the deployments JSON (flat address→name map) to
+    ///      find the address whose value matches `target`. forge-std's JSON
+    ///      helpers don't give a reverse lookup directly.
+    function _findByName(string memory j, string memory target) internal view returns (address) {
+        string[] memory keys = vm.parseJsonKeys(j, "$");
+        bytes32 targetH = keccak256(bytes(target));
+        for (uint256 i = 0; i < keys.length; i++) {
+            string memory v = abi.decode(vm.parseJson(j, string.concat(".", keys[i])), (string));
+            if (keccak256(bytes(v)) == targetH) {
+                return _parseAddr(keys[i]);
+            }
+        }
+        revert(string.concat("not found in deployments: ", target));
+    }
+
+    function _parseAddr(string memory s) internal pure returns (address) {
+        bytes memory b = bytes(s);
+        require(b.length == 42 && b[0] == "0" && b[1] == "x", "bad addr");
+        uint160 r = 0;
+        for (uint256 i = 2; i < 42; i++) {
+            r <<= 4;
+            uint8 c = uint8(b[i]);
+            if (c >= 48 && c <= 57) r |= uint160(c - 48);
+            else if (c >= 97 && c <= 102) r |= uint160(c - 87);
+            else if (c >= 65 && c <= 70) r |= uint160(c - 55);
+            else revert("bad hex");
+        }
+        return address(r);
     }
 }

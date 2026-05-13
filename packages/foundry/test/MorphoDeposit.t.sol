@@ -4,11 +4,14 @@ pragma solidity ^0.8.19;
 import {Test, console} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {Morpho} from "@morpho-blue/Morpho.sol";
-import {IMorpho, MarketParams, Id, Position, Market} from "@morpho-blue/interfaces/IMorpho.sol";
-import {MarketParamsLib} from "@morpho-blue/libraries/MarketParamsLib.sol";
+// NOTE: Don't import Morpho.sol — its `=0.8.19` pragma conflicts with OZ V5's
+// `^0.8.20+`. We deploy Morpho via `vm.deployCode` (from the pre-built
+// artifact, which forge compiles in its own unit) and use the IMorpho
+// interface for all calls.
+import {IMorpho, MarketParams} from "@morpho-blue/interfaces/IMorpho.sol";
 
-import {FCMVault} from "../contracts/FCMVault.sol";
+import {FCMVault, IAllowlist} from "../contracts/FCMVault.sol";
+import {Allowlist} from "../contracts/Allowlist.sol";
 import {MockPriceSource} from "../contracts/mocks/MockPriceSource.sol";
 import {V3PoolPriceSource} from "../contracts/mocks/V3PoolPriceSource.sol";
 import {FixedRateIrm} from "../contracts/morpho/FixedRateIrm.sol";
@@ -27,7 +30,6 @@ interface IAaveOracleMin {
 }
 
 contract MorphoDepositTest is Test {
-    using MarketParamsLib for MarketParams;
 
     address constant WETH         = 0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590;
     address constant PYUSD0       = 0x99aF3EeA856556646C98c8B9b2548Fe815240750;
@@ -49,8 +51,12 @@ contract MorphoDepositTest is Test {
         MockPriceSource wethSrc  = new MockPriceSource(int256(pColl));
         MockPriceSource pyusdSrc = new MockPriceSource(int256(pDebt));
 
-        // Morpho stack.
-        Morpho morpho = new Morpho(address(this));
+        // Morpho stack — deploy Morpho via vm.deployCode so we don't import
+        // the pragma-incompatible source.
+        IMorpho morpho = IMorpho(deployCode(
+            "lib/morpho-blue/src/Morpho.sol:Morpho",
+            abi.encode(address(this))
+        ));
         FixedRateIrm irm = new FixedRateIrm(1585489599); // 5% APR
         SimpleOracle morphoOracle = new SimpleOracle(address(wethSrc), address(pyusdSrc), 6, 18);
         morpho.enableIrm(address(irm));
@@ -71,25 +77,33 @@ contract MorphoDepositTest is Test {
         V3PoolPriceSource yieldOracle =
             new V3PoolPriceSource(yieldPool, YIELD_TOKEN, PYUSD0, AAVE_ORACLE);
 
-        // Lender side: someone has to supply PYUSD0 to Morpho before borrows
-        // can succeed. Supply 1M PYUSD0 from a deal'd account.
+        // Seed Morpho with PYUSD0 liquidity so the vault has something to borrow.
         deal(PYUSD0, address(this), 1_000_000e6);
         IERC20(PYUSD0).approve(address(morpho), type(uint256).max);
         morpho.supply(mp, 1_000_000e6, 0, address(this), "");
 
+        Allowlist allowlist = new Allowlist();
+        allowlist.set(alice, true);
+
         uint8 yieldDecimals = IERC20Decimals(YIELD_TOKEN).decimals();
-        vault = new FCMVault(
-            IERC20(WETH),
-            IERC20(YIELD_TOKEN),
-            yieldDecimals,
-            address(yieldOracle),
-            address(wethSrc),
-            address(pyusdSrc),
-            IMorpho(address(morpho)),
-            mp,
-            "Leveraged WETH",
-            "lvWETH"
-        );
+        vault = new FCMVault(FCMVault.InitParams({
+            underlying:            IERC20(WETH),
+            yieldAsset:            IERC20(YIELD_TOKEN),
+            yieldDecimals:         yieldDecimals,
+            yieldOracle:           address(yieldOracle),
+            collateralPriceOracle: address(wethSrc),
+            debtPriceOracle:       address(pyusdSrc),
+            morpho:                morpho,
+            marketParams:          mp,
+            allowlist:             IAllowlist(address(allowlist)),
+            maxSwapSlippageBps:    3000,
+            hfLowerThreshold:      1.10e18,
+            hfLowerTarget:         1.15e18,
+            hfUpperTarget:         1.45e18,
+            hfUpperThreshold:      1.50e18,
+            name:                  "Leveraged WETH",
+            symbol:                "lvWETH"
+        }));
 
         deal(WETH, alice, 1 ether);
     }

@@ -1,4 +1,7 @@
 {
+  "../../lib/Yearn-ERC4626-Router": {
+    "rev": "68165774ec8858b43db24620756402def14b7ec1"
+  },
   "lib/aave-v3-core": {
     "tag": {
       "name": "v1.19.4",
@@ -21,6 +24,15 @@
     "tag": {
       "name": "v5.6.1",
       "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+    }
+  },
+  "lib/uniswap-v3-static-quoter": {
+    "rev": "60e8c2c841e45d4ab50af10b56de605c02a1df09"
+  },
+  "lib/v3-core": {
+    "tag": {
+      "name": "v1.0.0",
+      "rev": "e3589b192d0be27e100cd0daaf6c97204fdb1899"
     }
   }
 }

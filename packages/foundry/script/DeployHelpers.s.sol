@@ -1,7 +1,7 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import { Script, console } from "forge-std/Script.sol";
+import { Script } from "forge-std/Script.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 contract ScaffoldETHDeploy is Script {
@@ -26,7 +26,7 @@ contract ScaffoldETHDeploy is Script {
     address deployer;
 
     /// @notice Use this modifier on your run() function on your deploy scripts
-    modifier ScaffoldEthDeployerRunner() {
+    modifier scaffoldEthDeployerRunner() {
         deployer = _startBroadcast();
         if (deployer == address(0)) {
             revert InvalidPrivateKey("Invalid private key");
@@ -63,14 +63,25 @@ contract ScaffoldETHDeploy is Script {
 
         string memory jsonWrite;
 
-        uint256 len = deployments.length;
+        // Merge with whatever was already written by previous deploy scripts
+        // running on the same chain. We split scripts to keep multi-version
+        // compilation happy (Morpho is 0.8.19, OZ V5 is ≥0.8.20, Yearn Router
+        // is 0.8.18), so each writes its own additions to the shared file.
+        if (vm.exists(path)) {
+            string memory existing = vm.readFile(path);
+            string[] memory keys = vm.parseJsonKeys(existing, "$");
+            for (uint256 i = 0; i < keys.length; i++) {
+                string memory v = abi.decode(vm.parseJson(existing, string.concat(".", keys[i])), (string));
+                vm.serializeString(jsonWrite, keys[i], v);
+            }
+        }
 
+        uint256 len = deployments.length;
         for (uint256 i = 0; i < len; i++) {
             vm.serializeString(jsonWrite, vm.toString(deployments[i].addr), deployments[i].name);
         }
 
         string memory chainName;
-
         try vm.getChain(block.chainid) returns (Vm.Chain memory chain) {
             chainName = chain.name;
         } catch {

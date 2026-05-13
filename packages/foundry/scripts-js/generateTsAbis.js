@@ -74,9 +74,13 @@ function getDeploymentHistory(broadcastPath) {
 
     for (const tx of transactions) {
       if (tx.transactionType === "CREATE" || tx.transactionType === "CREATE2") {
-        // Store or update contract deployment info
+        // forge's multi-version compilation suffixes contract names with the
+        // solc version (e.g. `WethPriceSource.0.8.19`). Strip the suffix so
+        // downstream artifact lookup matches `out/WethPriceSource.sol/...`.
+        const rawName = tx.contractName || "";
+        const cleanName = rawName.replace(/\.\d+\.\d+\.\d+$/, "");
         deploymentHistory.set(tx.contractAddress, {
-          contractName: tx.contractName,
+          contractName: cleanName,
           address: tx.contractAddress,
           deploymentFile: file,
           transaction: tx,
@@ -98,11 +102,20 @@ function getArtifactOfContract(contractName) {
 
   if (!existsSync(current_path_to_artifacts)) return null;
 
-  const artifactJson = JSON.parse(
-    readFileSync(`${current_path_to_artifacts}/${contractName}.json`)
-  );
-
-  return artifactJson;
+  // forge emits version-suffixed artifacts (`Foo.0.8.19.json`, `Foo.0.8.34.json`)
+  // when the same file is compiled by multiple solc versions across separate
+  // compilation units. Prefer the unsuffixed file; fall back to any matching
+  // suffixed one (the ABI is the same regardless of solc version).
+  const plain = `${current_path_to_artifacts}/${contractName}.json`;
+  let file = plain;
+  if (!existsSync(plain)) {
+    const match = readdirSync(current_path_to_artifacts).find(
+      f => f.startsWith(`${contractName}.`) && f.endsWith(".json")
+    );
+    if (!match) return null;
+    file = `${current_path_to_artifacts}/${match}`;
+  }
+  return JSON.parse(readFileSync(file));
 }
 
 function getInheritedFromContracts(artifact) {

@@ -1,3 +1,5 @@
 @openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
 @aave-v3-core/=lib/aave-v3-core/
 @morpho-blue/=lib/morpho-blue/src/
+@uniswap/v3-core/=lib/v3-core/
+@yearn-router/=lib/Yearn-ERC4626-Router/src/
